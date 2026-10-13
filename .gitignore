@@ -15,6 +15,12 @@ docs/
 CHANGELOG.md
 RELEASE-NOTES.md
 RECOVERY-NOTES.md
+HANDOFF.md
+*.handoff.md
+HANDOVER.md
+*.handover.md
+local-notes/
+handoff/
 wuwa-males-summary.md
 .local-archive/
 private-history/
