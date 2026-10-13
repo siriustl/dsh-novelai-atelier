@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: true
+# DSH's bundled pnpm enforces a minimum-release-age supply-chain policy that
+# rejects freshly published deps (dsh-* rc builds) during its pre-run automatic
+# install, breaking plain `pnpm build`/`pnpm test`. Deps are pinned in
+# pnpm-lock.yaml and installed once; skip the pre-run verify.
+verifyDepsBeforeRun: false

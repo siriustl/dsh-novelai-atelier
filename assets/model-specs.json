@@ -1,0 +1,387 @@
+{
+  "retrieved_at": "2026-09-19",
+  "source": "https://novelai.net/_next/static/chunks/pages/_app-82fe03e3291d150d.js",
+  "official_modules": {
+    "model_capabilities": 11366,
+    "default_parameters_and_quality": 63509,
+    "uc_presets": 33145,
+    "preset_hint_encoding": 15512
+  },
+  "hint_ids": {
+    "none": 0,
+    "standard": 1,
+    "heavy": 2,
+    "light": 3,
+    "humanFocus": 4,
+    "furryFocus": 5
+  },
+  "negative_compilation_note": "For Full models and a non-none UC preset with nonempty prefix, the official client prepends nsfw to the final negative prompt if the compiled positive base prompt does not include nsfw (case-insensitive). Curated models do not use this auto-add. Add preset text literally on client side; merely sending ucPresetId or qualityPresetId is not a substitute for compiling the prompt.",
+  "models": {
+    "nai-diffusion-5-full": {
+      "official_default_parameters_after_transport_normalization": {
+        "params_version": 4,
+        "width": 832,
+        "height": 1216,
+        "scale": 7,
+        "sampler": "k_euler_ancestral",
+        "steps": 23,
+        "n_samples": 1,
+        "cfg_rescale": 0,
+        "noise_schedule": "karras",
+        "legacy": false,
+        "legacy_v3_extend": false,
+        "dynamic_thresholding": false,
+        "add_original_image": true,
+        "use_coords": false,
+        "legacy_uc": false,
+        "normalize_reference_strength_multiple": true,
+        "autoSmea": false,
+        "controlnet_strength": 1,
+        "inpaintImg2ImgStrength": 1,
+        "deliberate_euler_ancestral_bug": false,
+        "prefer_brownian": true,
+        "ucPresetId": "heavy",
+        "qualityPresetId": "standard",
+        "tag_hint_qt": 1,
+        "tag_hint_uc_preset": 2,
+        "characterPrompts": [],
+        "straight_alpha": true
+      },
+      "note": "seed is supplied at request time. input/negative text and v4 prompt objects are compiled from selected presets. image_format defaults to webp on current official API requests; the UI converts arrivals to PNG by default. The direct API example deliberately asks for png. These are inspected client defaults, not a complete formally published server schema.",
+      "quality_presets": [
+        {
+          "id": "standard",
+          "suffix": "very aesthetic, masterpiece, no text"
+        },
+        {
+          "id": "light",
+          "suffix": "very aesthetic, amazing quality, no text"
+        },
+        {
+          "id": "none"
+        }
+      ],
+      "uc_presets": [
+        {
+          "id": "heavy",
+          "name": "heavy",
+          "category": "heavy",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "light",
+          "name": "light",
+          "category": "light",
+          "prefix": "lowres, bad hands, bad anatomy, artistic error, sepia, white haze, worst quality, very displeasing, jpeg artifacts, 0::ai-generated::"
+        },
+        {
+          "id": "furryFocus",
+          "name": "furryFocus",
+          "category": "furry",
+          "prefix": "{worst quality}, distracting watermark, unfinished, bad quality, {widescreen}, upscale, {sequence}, {{grandfathered content}}, blurred foreground, chromatic aberration, sketch, everyone, [sketch background], simple, [flat colors], ych (character), outline, multiple scenes, [[horror (theme)]], comic"
+        },
+        {
+          "id": "humanFocus",
+          "name": "humanFocus",
+          "category": "human",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, @_@, mismatched pupils, glowing eyes, bad anatomy"
+        },
+        {
+          "id": "none",
+          "name": "none",
+          "category": "none"
+        }
+      ],
+      "default_quality_preset": "standard",
+      "default_uc_preset": "heavy",
+      "capabilities": {
+        "max_characters_client": 32,
+        "freeform_character_position": true,
+        "position_single_character": true,
+        "opus_usage_limit": true,
+        "numeric_emphasis": true,
+        "v4_prompts": true,
+        "sampler_noise_schedule_selector": false,
+        "noise_schedule_sent": "karras",
+        "variety_boost": false,
+        "variety_boost_sigma_if_enabled": null,
+        "smea": false,
+        "dynamic_thresholding": false,
+        "vibe_transfer": false,
+        "precise_reference": false,
+        "transparent_background": true
+      }
+    },
+    "nai-diffusion-5-curated": {
+      "official_default_parameters_after_transport_normalization": {
+        "params_version": 4,
+        "width": 832,
+        "height": 1216,
+        "scale": 7,
+        "sampler": "k_euler_ancestral",
+        "steps": 23,
+        "n_samples": 1,
+        "cfg_rescale": 0,
+        "noise_schedule": "karras",
+        "legacy": false,
+        "legacy_v3_extend": false,
+        "dynamic_thresholding": false,
+        "add_original_image": true,
+        "use_coords": false,
+        "legacy_uc": false,
+        "normalize_reference_strength_multiple": true,
+        "autoSmea": false,
+        "controlnet_strength": 1,
+        "inpaintImg2ImgStrength": 1,
+        "deliberate_euler_ancestral_bug": false,
+        "prefer_brownian": true,
+        "ucPresetId": "heavy",
+        "qualityPresetId": "standard",
+        "tag_hint_qt": 1,
+        "tag_hint_uc_preset": 2,
+        "characterPrompts": [],
+        "straight_alpha": true
+      },
+      "note": "seed is supplied at request time. input/negative text and v4 prompt objects are compiled from selected presets. image_format defaults to webp on current official API requests; the UI converts arrivals to PNG by default. The direct API example deliberately asks for png. These are inspected client defaults, not a complete formally published server schema.",
+      "quality_presets": [
+        {
+          "id": "standard",
+          "suffix": "very aesthetic, masterpiece, no text"
+        },
+        {
+          "id": "light",
+          "suffix": "very aesthetic, amazing quality, no text"
+        },
+        {
+          "id": "none"
+        }
+      ],
+      "uc_presets": [
+        {
+          "id": "heavy",
+          "name": "heavy",
+          "category": "heavy",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "light",
+          "name": "light",
+          "category": "light",
+          "prefix": "lowres, bad hands, bad anatomy, artistic error, sepia, white haze, worst quality, very displeasing, jpeg artifacts, 0::ai-generated::"
+        },
+        {
+          "id": "furryFocus",
+          "name": "furryFocus",
+          "category": "furry",
+          "prefix": "{worst quality}, distracting watermark, unfinished, bad quality, {widescreen}, upscale, {sequence}, {{grandfathered content}}, blurred foreground, chromatic aberration, sketch, everyone, [sketch background], simple, [flat colors], ych (character), outline, multiple scenes, [[horror (theme)]], comic"
+        },
+        {
+          "id": "humanFocus",
+          "name": "humanFocus",
+          "category": "human",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, @_@, mismatched pupils, glowing eyes, bad anatomy"
+        },
+        {
+          "id": "none",
+          "name": "none",
+          "category": "none"
+        }
+      ],
+      "default_quality_preset": "standard",
+      "default_uc_preset": "heavy",
+      "capabilities": {
+        "max_characters_client": 32,
+        "freeform_character_position": true,
+        "position_single_character": true,
+        "opus_usage_limit": true,
+        "numeric_emphasis": true,
+        "v4_prompts": true,
+        "sampler_noise_schedule_selector": false,
+        "noise_schedule_sent": "karras",
+        "variety_boost": false,
+        "variety_boost_sigma_if_enabled": null,
+        "smea": false,
+        "dynamic_thresholding": false,
+        "vibe_transfer": false,
+        "precise_reference": false,
+        "transparent_background": true
+      }
+    },
+    "nai-diffusion-4-5-full": {
+      "official_default_parameters_after_transport_normalization": {
+        "params_version": 4,
+        "width": 832,
+        "height": 1216,
+        "scale": 5,
+        "sampler": "k_euler_ancestral",
+        "steps": 23,
+        "n_samples": 1,
+        "cfg_rescale": 0,
+        "noise_schedule": "karras",
+        "legacy": false,
+        "legacy_v3_extend": false,
+        "dynamic_thresholding": false,
+        "add_original_image": true,
+        "use_coords": false,
+        "legacy_uc": false,
+        "normalize_reference_strength_multiple": true,
+        "autoSmea": false,
+        "controlnet_strength": 1,
+        "inpaintImg2ImgStrength": 1,
+        "deliberate_euler_ancestral_bug": false,
+        "prefer_brownian": true,
+        "ucPresetId": "heavy",
+        "qualityPresetId": "standard",
+        "tag_hint_qt": 1,
+        "tag_hint_uc_preset": 2,
+        "characterPrompts": [],
+        "skip_cfg_above_sigma": null
+      },
+      "note": "seed is supplied at request time. input/negative text and v4 prompt objects are compiled from selected presets. image_format defaults to webp on current official API requests; the UI converts arrivals to PNG by default. The direct API example deliberately asks for png. These are inspected client defaults, not a complete formally published server schema.",
+      "quality_presets": [
+        {
+          "id": "standard",
+          "suffix": "very aesthetic, masterpiece, no text"
+        },
+        {
+          "id": "none"
+        }
+      ],
+      "uc_presets": [
+        {
+          "id": "heavy",
+          "name": "heavy",
+          "category": "heavy",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "light",
+          "name": "light",
+          "category": "light",
+          "prefix": "lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, multiple views, very displeasing, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "furryFocus",
+          "name": "furryFocus",
+          "category": "furry",
+          "prefix": "{worst quality}, distracting watermark, unfinished, bad quality, {widescreen}, upscale, {sequence}, {{grandfathered content}}, blurred foreground, chromatic aberration, sketch, everyone, [sketch background], simple, [flat colors], ych (character), outline, multiple scenes, [[horror (theme)]], comic"
+        },
+        {
+          "id": "humanFocus",
+          "name": "humanFocus",
+          "category": "human",
+          "prefix": "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, @_@, mismatched pupils, glowing eyes, bad anatomy"
+        },
+        {
+          "id": "none",
+          "name": "none",
+          "category": "none"
+        }
+      ],
+      "default_quality_preset": "standard",
+      "default_uc_preset": "heavy",
+      "capabilities": {
+        "max_characters_client": 6,
+        "freeform_character_position": false,
+        "position_single_character": false,
+        "opus_usage_limit": false,
+        "numeric_emphasis": true,
+        "v4_prompts": true,
+        "sampler_noise_schedule_selector": true,
+        "noise_schedule_sent": "karras",
+        "variety_boost": true,
+        "variety_boost_sigma_if_enabled": 58,
+        "smea": false,
+        "dynamic_thresholding": false,
+        "vibe_transfer": true,
+        "precise_reference": true,
+        "transparent_background": false
+      }
+    },
+    "nai-diffusion-4-5-curated": {
+      "official_default_parameters_after_transport_normalization": {
+        "params_version": 4,
+        "width": 832,
+        "height": 1216,
+        "scale": 5,
+        "sampler": "k_euler_ancestral",
+        "steps": 23,
+        "n_samples": 1,
+        "cfg_rescale": 0,
+        "noise_schedule": "karras",
+        "legacy": false,
+        "legacy_v3_extend": false,
+        "dynamic_thresholding": false,
+        "add_original_image": true,
+        "use_coords": false,
+        "legacy_uc": false,
+        "normalize_reference_strength_multiple": true,
+        "autoSmea": false,
+        "controlnet_strength": 1,
+        "inpaintImg2ImgStrength": 1,
+        "deliberate_euler_ancestral_bug": false,
+        "prefer_brownian": true,
+        "ucPresetId": "heavy",
+        "qualityPresetId": "standard",
+        "tag_hint_qt": 1,
+        "tag_hint_uc_preset": 2,
+        "characterPrompts": [],
+        "skip_cfg_above_sigma": null
+      },
+      "note": "seed is supplied at request time. input/negative text and v4 prompt objects are compiled from selected presets. image_format defaults to webp on current official API requests; the UI converts arrivals to PNG by default. The direct API example deliberately asks for png. These are inspected client defaults, not a complete formally published server schema.",
+      "quality_presets": [
+        {
+          "id": "standard",
+          "suffix": "very aesthetic, masterpiece, no text, -0.8::feet::, rating:general"
+        },
+        {
+          "id": "none"
+        }
+      ],
+      "uc_presets": [
+        {
+          "id": "heavy",
+          "name": "heavy",
+          "category": "heavy",
+          "prefix": "blurry, lowres, upscaled, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, halftone, multiple views, logo, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "light",
+          "name": "light",
+          "category": "light",
+          "prefix": "blurry, lowres, upscaled, artistic error, scan artifacts, jpeg artifacts, logo, too many watermarks, negative space, blank page"
+        },
+        {
+          "id": "humanFocus",
+          "name": "humanFocus",
+          "category": "human",
+          "prefix": "blurry, lowres, upscaled, artistic error, film grain, scan artifacts, bad anatomy, bad hands, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, halftone, multiple views, logo, too many watermarks, @_@, mismatched pupils, glowing eyes, negative space, blank page"
+        },
+        {
+          "id": "none",
+          "name": "none",
+          "category": "none"
+        }
+      ],
+      "default_quality_preset": "standard",
+      "default_uc_preset": "heavy",
+      "capabilities": {
+        "max_characters_client": 6,
+        "freeform_character_position": false,
+        "position_single_character": false,
+        "opus_usage_limit": false,
+        "numeric_emphasis": true,
+        "v4_prompts": true,
+        "sampler_noise_schedule_selector": true,
+        "noise_schedule_sent": "karras",
+        "variety_boost": true,
+        "variety_boost_sigma_if_enabled": 58,
+        "smea": false,
+        "dynamic_thresholding": false,
+        "vibe_transfer": true,
+        "precise_reference": true,
+        "transparent_background": false
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+lib/
+*.tsbuildinfo
+*.tgz
+release/
+
+# Verification & Test outputs
+.nai-verification/
+
+# Internal docs & local notes
+AGENTS.md
+docs/
+CHANGELOG.md
+RELEASE-NOTES.md
+RECOVERY-NOTES.md
+HANDOFF.md
+*.handoff.md
+HANDOVER.md
+*.handover.md
+local-notes/
+handoff/
+.local-archive/
+private-history/
+
+# Ephemeral dev & exploratory scripts
+scripts/debug-*
+scripts/qa-*
+scripts/probe-*
+scripts/trace-*
+scripts/inspect-*
+scripts/verify-round*
+scripts/verify-live*
+scripts/audit-live-*
+scripts/finalize-*
+scripts/runtime-*
+scripts/*.cjs
+
+# Environment & credentials
+.env
+.env.*
+*.local
+secrets/
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
