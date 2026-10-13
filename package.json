@@ -1,0 +1,96 @@
+{
+  "name": "dsh-novelai-atelier",
+  "version": "0.15.3",
+  "description": "NovelAI Atelier for DeepSeek Harness: NovelAI V5/V4.5 image generation tools + embedded workbench",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "novelai",
+    "cordis",
+    "image-generation",
+    "ai-art"
+  ],
+  "main": "./lib/index.js",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.8.0",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./host": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/host-live.js"
+    },
+    "./agent": {
+      "types": "./lib/agent.d.ts",
+      "default": "./lib/agent.js"
+    },
+    "./client": {
+      "types": "./lib/types-client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsdown && node scripts/build-client.mjs",
+    "typecheck": "tsc -b tsconfig.json tsconfig.client.json",
+    "test": "vitest run",
+    "verify:package": "node scripts/verify-package.mjs",
+    "verify:ui": "node scripts/verify-ui.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-scope": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "lucide-react": "^0.468.0",
+    "sharp": "0.35.5",
+    "undici": "^7.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@types/node": "^24",
+    "@types/react": "^19",
+    "esbuild": "^0.25.0",
+    "playwright": "^1.58.0",
+    "react": "^19",
+    "react-dom": "^19",
+    "react18": "npm:react@18.3.1",
+    "react-dom18": "npm:react-dom@18.3.1",
+    "tsdown": "^0.12.0",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  }
+}

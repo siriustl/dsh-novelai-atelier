@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+lib/
+*.tsbuildinfo
+*.tgz
+release/
+
+# Verification & Test outputs
+.nai-verification/
+
+# Internal docs & local verification history (do not publish)
+docs/
+CHANGELOG.md
+RELEASE-NOTES.md
+RECOVERY-NOTES.md
+wuwa-males-summary.md
+.local-archive/
+private-history/
+
+# Ephemeral dev & exploratory scripts
+scripts/click-test.cjs
+scripts/debug-round5.cjs
+scripts/inspect-page.cjs
+scripts/inspect-deferred-runtime.mjs
+scripts/probe-quote.cjs
+scripts/probe-host-export.mjs
+scripts/trace-400.cjs
+scripts/scan-parens.cjs
+scripts/http-e2e.cjs
+scripts/repair-live-doc.cjs
+scripts/export-male-v5.mjs
+scripts/collect-male-v5.mjs
+scripts/qa-*
+scripts/verify-round*
+scripts/verify-live*
+scripts/verify-folder-reveal.mjs
+scripts/verify-sharp-runtime.mjs
+scripts/verify-runtime.mjs
+scripts/verify-share-package.mjs
+scripts/verify-usage-build.mjs
+scripts/verify-package-sdk-*.mjs
+scripts/verify-peer-scope-runtime.mjs
+scripts/audit-live-*.mjs
+scripts/finalize-*.mjs
+scripts/runtime-*.mjs
+
+# Environment & credentials
+.env
+.env.*
+*.local
+secrets/
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+
