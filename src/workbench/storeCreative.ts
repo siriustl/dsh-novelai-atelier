@@ -1,6 +1,7 @@
 /** Store part: conversations, messages, assistant runs, gallery queries. Ported from creative_store.py. */
 import type { Store, Rec } from './store.ts'
-import { ConflictError, KeyError, encode, integer, nowStamp, randomId } from './util.ts'
+import { ConflictError, KeyError, encode, integer, nowStamp, randomId, asUtc } from './util.ts'
+import { entryFilterTag } from './library.ts'
 
 export function applyStoreCreative(store: Store): void {
   const data = () => store.data
@@ -151,23 +152,52 @@ export function applyStoreCreative(store: Store): void {
     return store.getAssistantRun(ident)
   }
 
-  store.queryJobs = (opts: { query?: string; offset?: number; limit?: number; model?: string; scheduleId?: string; libraryId?: string; status?: string; favorite?: boolean; archived?: boolean; after?: string; before?: string } = {}): Rec => {
-    const { query = '', offset = 0, limit = 48, model = '', scheduleId = '', libraryId = '', status = '', favorite = false, archived = false, after = '', before = '' } = opts
+  store.queryJobs = (opts: { query?: string; offset?: number; limit?: number; model?: string; scheduleId?: string; characterId?: string; artistId?: string; status?: string; favorite?: boolean; archived?: boolean; after?: string; before?: string } = {}): Rec => {
+    const { query = '', offset = 0, limit = 48, model = '', scheduleId = '', characterId = '', artistId = '', status = '', favorite = false, archived = false, after = '', before = '' } = opts
     integer(offset, '分页位置', 0, 2 ** 31)
     integer(limit, '每页数量', 1, 200)
+    const dateBound = (value: string): number | null => {
+      const normalized = value.trim()
+      if (!normalized) return null
+      try {
+        return asUtc(/^\d{4}-\d{2}-\d{2}$/u.test(normalized) ? normalized + 'T00:00:00Z' : normalized).getTime()
+      } catch { throw new Error('Gallery date bounds must be ISO 8601 dates with a timezone or YYYY-MM-DD') }
+    }
+    const afterTime = dateBound(after), beforeTime = dateBound(before)
+    if (afterTime !== null && beforeTime !== null && afterTime > beforeTime) throw new Error('after must not be later than before')
     const rows = data().jobs.filter((j) => j.archived === (archived ? 1 : 0))
+    const normalize = (value: unknown): string => typeof value === 'string' ? value.toLowerCase().replace(/\s+/gu, ' ').trim() : ''
+    // Filters match the tag text inside a work's own prompt, never provenance: a character
+    // contributes its first main-prompt tag, an artist its whole main prompt. A selected
+    // entry that is missing or of the wrong kind matches nothing instead of silently
+    // widening the result.
+    const entries = characterId || artistId ? store.listEntries() : []
+    const filterTag = (id: string, kind: string): string | null => {
+      if (!id) return null
+      const entry = entries.find((row) => row['id'] === id)
+      return entry && entry['kind'] === kind ? normalize(entryFilterTag(entry)) : ''
+    }
+    const characterTag = filterTag(characterId, 'character')
+    const artistTag = filterTag(artistId, 'artist')
+    const jobText = (snapshot: Rec): string => {
+      const request = (snapshot['request'] ?? {}) as Rec
+      const characters = Array.isArray(request['characters']) ? request['characters'] as Rec[] : []
+      return normalize([request['prompt'], ...characters.map((character) => character?.['prompt'])]
+        .filter((value): value is string => typeof value === 'string' && value.length > 0).join('\n'))
+    }
     const filtered = rows.filter((j) => {
       if (status && j.status !== status) return false
       if (scheduleId && j.schedule_id !== scheduleId) return false
-      if (after && j.created_at < after) return false
-      if (before && j.created_at > before) return false
+      if (afterTime !== null && Date.parse(j.created_at) < afterTime) return false
+      if (beforeTime !== null && Date.parse(j.created_at) > beforeTime) return false
       if (favorite && j.favorite !== 1) return false
       const snapshot = JSON.parse(j.snapshot) as Rec
       if (model && ((snapshot['request'] as Rec)?.['model'] ?? '') !== model) return false
-      if (libraryId) {
-        const refs = (snapshot['library_refs'] ?? []) as unknown[]
-        const hit = refs.some((r) => typeof r === 'string' ? r === libraryId : ((r as Rec)['id'] === libraryId || (r as Rec)['parent_id'] === libraryId))
-        if (!hit) return false
+      if (characterTag === '' || artistTag === '') return false
+      if (characterTag || artistTag) {
+        const text = jobText(snapshot)
+        if (characterTag && !text.includes(characterTag)) return false
+        if (artistTag && !text.includes(artistTag)) return false
       }
       if (query) {
         const haystack = JSON.stringify(snapshot).toLowerCase()

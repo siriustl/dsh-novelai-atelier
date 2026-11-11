@@ -166,4 +166,40 @@ describe('public tools through the real SDK output contract', () => {
       expect(await f.run('nai_prepare_image')).toMatchObject({ isError: true })
     } finally { await f.dispose() }
   })
+
+  it('keeps credit and quote payloads lean and honors endpoint from request', async () => {
+    const f = await fixture()
+    try {
+      f.wb.settings.save({ nai_endpoints: [
+        { name: '甲', base_url: 'https://relay.example/v1', token: 'token-aaaa-1111', enabled: true, v5_share: 4, assume_opus: true },
+        { name: '乙', base_url: 'https://image.novelai.net', token: 'pst-official-2222', enabled: true },
+      ] })
+      vi.spyOn(f.wb.executor, 'credits').mockResolvedValue({
+        active: false, tier: 0, expires_at: 0,
+        anlas: { subscription: 0, purchased: 2433, total: 2433 },
+        perks: {}, v5_usage: null, v5_usage_summary: null,
+      } as never)
+      vi.spyOn(f.wb, 'endpointAllowance').mockResolvedValue({
+        ok: true, percent: 99.98, available_images: 432.4, capacity_images: 432.5, share_count: 4,
+      } as never)
+
+      const multi = success(await f.run('nai_check_credits'))
+      expect(multi.endpoints).toHaveLength(2)
+      expect(multi).not.toHaveProperty('default_model_eligibility')
+      expect(multi.active_endpoint).toBe(String(multi.endpoints.find((entry: any) => entry.active).id))
+      expect(multi.endpoints[0].default_model_eligibility['policy']).toBeTruthy()
+      expect(JSON.stringify(multi)).not.toContain('refill_note')
+
+      const single = success(await f.run('nai_check_credits', { endpoint: String(multi.endpoints[0].id) }))
+      expect(single).not.toHaveProperty('endpoints')
+      expect(single.allowance.percent).toBe(99.98)
+      expect(single.default_model_eligibility['nai-diffusion-5-full'].v5_usage_condition).toContain('99.98%')
+
+      // `endpoint` inside request must not be dropped silently.
+      const quote = success(await f.run('nai_quote', { operation: 'generate', request: { prompt: 'tree', width: 64, height: 64, steps: 1, endpoint: String(multi.endpoints[0].id) } }))
+      expect(quote.endpoint.id).toBe(String(multi.endpoints[0].id))
+      expect(quote.endpoint.v5_share).toBe(4)
+      expect(quote).not.toHaveProperty('basis')
+    } finally { await f.dispose() }
+  })
 })

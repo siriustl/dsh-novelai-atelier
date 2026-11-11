@@ -200,9 +200,13 @@ export class Store {
 
   // ---------- entries / assets (defined in storeEntries.ts) ----------
   declare listEntries: (query?: string, kind?: string | null) => Rec[]
+  declare queryEntries: (opts?: { query?: string; kind?: string | null; tag?: string | null; favorite?: boolean; sort?: string; offset?: number; limit?: number }) => Rec
   declare getEntry: (id: string) => Rec
   declare saveEntry: (data: Rec, id?: string | null, expectedRevision?: number | null) => Rec
   declare deleteEntry: (id: string, expectedRevision?: number | null) => void
+  declare recordEntryUse: (id: string, at?: string | null) => Rec
+  declare recordEntriesUse: (ids: string[], at?: string | null) => Rec[]
+  declare setEntryFavorite: (id: string, favorite: boolean, expectedRevision?: number | null) => Rec
   declare importEntries: (entries: Rec[], choices?: Rec | null, expectedRevisions?: Rec | null) => Rec
   declare addAsset: (data: Rec) => Rec
   declare getAsset: (id: string) => Rec
@@ -251,7 +255,7 @@ export class Store {
   declare forkConversation: (ident: string, messageId: string) => Rec
   declare getAssistantRun: (ident: string) => Rec
   declare updateAssistantRun: (ident: string, opts?: { status?: string | null; event?: Rec | null; data?: Rec | null; cancel?: boolean }) => Rec
-  declare queryJobs: (opts?: { query?: string; offset?: number; limit?: number; model?: string; scheduleId?: string; libraryId?: string; status?: string; favorite?: boolean; archived?: boolean; after?: string; before?: string }) => Rec
+  declare queryJobs: (opts?: { query?: string; offset?: number; limit?: number; model?: string; scheduleId?: string; characterId?: string; artistId?: string; status?: string; favorite?: boolean; archived?: boolean; after?: string; before?: string }) => Rec
   declare curateJobs: (ids: string[], opts?: { favorite?: boolean | null; archived?: boolean | null }) => Rec
 
   // ---------- shared internals ----------

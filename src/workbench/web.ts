@@ -5,6 +5,9 @@ import type { AssistantContext } from './assistant.ts'
 import { Workbench, guide, presets, publicJob } from './app.ts'
 import type { Rec } from './store.ts'
 import { parseMultipart } from './multipart.ts'
+import { searchTags, translateTags, loadTagCatalog, normalizeTag, type TagEntry } from './tags.ts'
+import { cleanPngMetadata } from '../core/png.ts'
+import { zipSync } from 'fflate'
 
 export interface WebDeps {
   workbench: Workbench
@@ -73,6 +76,42 @@ function imageMime(data: Uint8Array): string {
 
 const fs = () => import('node:fs')
 
+async function withRequestSignal<T>(res: ServerResponse, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController()
+  const closed = () => { if (!res.writableEnded) controller.abort() }
+  res.once('close', closed)
+  try { return await action(controller.signal) } finally { res.off('close', closed) }
+}
+
+async function readRegisteredPng(wb: Workbench, path: string): Promise<Buffer> {
+  const fsp = await import('node:fs/promises')
+  const target = await fsp.realpath(path)
+  const assetRoot = await fsp.realpath(wb.assets.directory)
+  const canonical = async (file: unknown): Promise<string | null> => {
+    if (typeof file !== 'string') return null
+    try { return await fsp.realpath(file) } catch { return null }
+  }
+  const localAssets = await Promise.all(wb.store.listAssets().map(async (asset) => {
+    const file = await canonical(asset['path'])
+    if (!file) return null
+    const relative = relativePath(assetRoot, file)
+    return relative.startsWith('..') || isAbsolute(relative) ? null : file
+  }))
+  const outputs = wb.store.listJobs(10000).flatMap((job) => {
+    const files = (job['result'] as Rec | null)?.['artifact_paths']
+    return Array.isArray(files) ? files : []
+  })
+  const registered = localAssets.includes(target) || (await Promise.all(outputs.map(canonical))).includes(target)
+  if (!registered) throw new HttpStatus(403, '只允许清洗工作台已登记的素材与作品')
+  const stat = await fsp.stat(target)
+  if (!stat.isFile()) throw new HttpStatus(400, '请选择 PNG 图片')
+  if (stat.size > 48 * 1024 * 1024) throw new HttpStatus(413, '图片超过 48 MiB')
+  const data = await fsp.readFile(target)
+  if (data.length > 48 * 1024 * 1024) throw new HttpStatus(413, '图片超过 48 MiB')
+  if (imageMime(data) !== 'image/png') throw new HttpStatus(400, '脱敏下载仅支持 PNG 原图')
+  return data
+}
+
 export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: ServerResponse, pathname: string) => Promise<boolean> {
   const wb = deps.workbench
 
@@ -85,7 +124,7 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
     const epoch = wb.restoreEpoch
     const readOnly = method === 'GET' || method === 'HEAD' || (method === 'POST' && (
       ['validate', 'quote', 'inspect', 'recover', 'workspace/read', 'library/export', 'library/preview',
-        'library/import-preview', 'gallery/export', 'backups/preview', 'schedules/preview', 'settings/test'].includes(path)
+        'library/import-preview', 'gallery/export', 'gallery/clean-export', 'gallery/clean-image', 'tags/translate', 'backups/preview', 'schedules/preview', 'settings/test'].includes(path)
       || (pieces[0] === 'conversations' && pieces.length === 3 && pieces[2] === 'context')
     ))
     const q = (name: string) => url.searchParams.get(name)
@@ -170,7 +209,7 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
       if (path === 'settings' && method === 'PUT') return ok(wb.settings.save(body))
       if (path === 'settings/test' && method === 'POST') return ok(await testConnection(wb, body))
       if (path === 'settings/ai-channel' && method === 'GET') return ok(await wb.aiChannelCatalog())
-      if (path === 'credits' && method === 'GET') return ok(await wb.credits())
+      if (path === 'credits' && method === 'GET') return ok(await wb.creditsOverview())
       if (path === 'schema' && method === 'GET') {
         const operation = q('operation') ?? 'generate'
         const described = (await import('./describe.ts')).describeOperation() as Rec
@@ -185,6 +224,78 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
         if (query.length < 2 || query.length > 60) throw new Error('请输入 2–60 字符的标签片段')
         const tags = await wb.executor.suggestTags(query, q('model') ?? 'nai-diffusion-5-full', (q('language') as 'en' | 'jp') ?? 'en')
         return ok({ tags })
+      }
+      if (path === 'tags/suggest' && method === 'GET') {
+        const query = q('query') ?? q('q') ?? ''
+        const limit = Number(q('limit')) || 15
+        const localSuggestions = searchTags(query, limit, wb.assets.directory)
+        if (/^[a-zA-Z0-9_\s-]+$/.test(query.trim()) && query.trim().length >= 1) {
+          try {
+            const remote = await wb.executor.suggestTags(query.trim(), 'nai-diffusion-5-full', 'en').catch(() => [])
+            const catalog = loadTagCatalog(wb.assets.directory)
+            const lookup = new Map<string, TagEntry>()
+            for (const item of catalog) lookup.set(normalizeTag(item.name), item)
+            const names = new Set(localSuggestions.map((s) => s.name))
+            for (const r of remote) {
+              const tag = r.tag
+              if (!names.has(tag)) {
+                const found = lookup.get(normalizeTag(tag))
+                localSuggestions.push({
+                  name: tag,
+                  zh: found?.zh || r.japanese || '',
+                  category: found?.category || 'general',
+                  count: r.count || 0,
+                  matchType: 'prefix',
+                })
+                names.add(tag)
+              }
+              if (localSuggestions.length >= limit * 2) break
+            }
+          } catch {}
+        }
+        return ok({ suggestions: localSuggestions.slice(0, limit) })
+      }
+      if (path === 'tags/translate' && method === 'POST') {
+        const tags = Array.isArray(body['tags']) ? body['tags'].map(String) : []
+        return ok({ translations: translateTags(tags, wb.assets.directory) })
+      }
+      if (path === 'inspiration/search' && method === 'GET') {
+        const query = q('query') ?? q('q') ?? ''
+        const source = (q('source') as 'all' | 'danbooru' | 'pixiv' | 'aitag') || 'all'
+        const limit = Number(q('limit') ?? 24)
+        const page = Number(q('page') ?? 1)
+        const pixivAi = q('pixivAi')
+        if (pixivAi !== null && pixivAi !== 'all' && pixivAi !== 'exclude') throw new HttpStatus(400, 'Pixiv AI 标记筛选无效')
+        if (!Number.isInteger(limit) || limit < 1 || limit > 50 || !Number.isInteger(page) || page < 1 || page > 1000)
+          throw new HttpStatus(400, '分页参数无效')
+        return ok(await withRequestSignal(res, (signal) => wb.inspiration.search({ query, source, limit, page, signal, ...(pixivAi ? { pixivAi } : {}) })))
+      }
+      if (path === 'inspiration/detail' && method === 'GET') {
+        const source = q('source') as 'danbooru' | 'pixiv' | 'aitag'
+        const id = q('id') ?? ''
+        return ok(await withRequestSignal(res, (signal) => wb.inspiration.detail({ source, id, signal })))
+      }
+      if (path === 'inspiration/image' && method === 'GET') {
+        const rawUrl = q('url') ?? ''
+        if (!rawUrl) return json(res, 400, { error: 'url required' })
+        let parsed: URL
+        try { parsed = new URL(rawUrl) } catch { throw new HttpStatus(400, 'Invalid image URL') }
+        const allowedHosts = new Set(['cdn.donmai.us', 'i.pximg.net', 's.pximg.net', 'ai-img.10118899.xyz'])
+        if (parsed.protocol !== 'https:' || parsed.port || parsed.username || parsed.password || !allowedHosts.has(parsed.hostname.toLowerCase()))
+          throw new HttpStatus(403, 'Image URL not allowed')
+        try {
+          const img = await withRequestSignal(res, (signal) => wb.inspiration.fetchImage(rawUrl, signal))
+          res.writeHead(200, {
+            'Content-Type': img.contentType,
+            'Content-Length': img.buffer.length,
+            'Cache-Control': 'private, max-age=86400',
+            'X-Content-Type-Options': 'nosniff',
+          })
+          res.end(img.buffer)
+          return true
+        } catch (e) {
+          return json(res, 502, { error: (e as Error).message })
+        }
       }
       if ((path === 'validate' || path === 'quote') && method === 'POST') {
         return ok(path === 'validate' ? await wb.validate(String(body['operation'] ?? 'generate'), body['request'] as Rec)
@@ -215,6 +326,21 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
       }
       if (path === 'library' && method === 'GET') return ok(wb.store.listEntries(q('query') ?? '', q('kind') || null))
       if (path === 'library' && method === 'POST') return ok(wb.store.saveEntry(body))
+      if (path === 'library/query' && method === 'GET') {
+        return ok(wb.store.queryEntries({
+          query: q('query') ?? '', kind: q('kind') || null, tag: q('tag') || null,
+          favorite: q('favorite') === 'true', sort: q('sort') || 'updated',
+          offset: q('offset') === null ? 0 : Number(q('offset')),
+          limit: q('limit') === null ? undefined : Number(q('limit')),
+        }))
+      }
+      if (pieces[0] === 'library' && pieces.length === 3 && method === 'POST') {
+        if (pieces[2] === 'use') { wb.store.recordEntryUse(pieces[1]!); return ok({ recorded: true }) }
+        if (pieces[2] === 'favorite') {
+          if (typeof body['favorite'] !== 'boolean') throw new Error('favorite 必须是布尔值')
+          return ok(wb.store.setEntryFavorite(pieces[1]!, body['favorite'], (body['revision'] as number) ?? null))
+        }
+      }
       if (pieces[0] === 'library' && pieces.length === 2) {
         if (method === 'PUT') return ok(wb.store.saveEntry(body, pieces[1], (body['revision'] as number) ?? null))
         if (method === 'DELETE') { wb.store.deleteEntry(pieces[1]!, q('revision') === null ? null : Number(q('revision'))); return ok({ deleted: true }) }
@@ -351,7 +477,8 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
       if (path === 'gallery' && method === 'GET') {
         const result = wb.store.queryJobs({
           query: q('query') ?? '', offset: Number(q('offset') ?? 0), limit: Number(q('limit') ?? 48),
-          model: q('model') ?? '', scheduleId: q('schedule_id') ?? '', libraryId: q('library_id') ?? '',
+          model: q('model') ?? '', scheduleId: q('schedule_id') ?? '',
+          characterId: q('character_id') ?? '', artistId: q('artist_id') ?? '',
           favorite: q('favorite') === 'true', archived: q('archived') === 'true', status: q('status') ?? '',
           after: q('after') ?? '', before: q('before') ?? '',
         }) as Rec
@@ -359,7 +486,7 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
       }
       if (path === 'gallery/reveal' && method === 'POST') {
         const { revealArtwork } = await import('./reveal.ts')
-        return ok(await revealArtwork(wb, body['job_id'], body['asset_id']))
+        return ok(await revealArtwork(wb, body['job_id'], body['asset_id'], undefined, { select: Boolean(body['select']) }))
       }
       if (path === 'gallery/curate' && method === 'POST') return ok(wb.store.curateJobs(body['ids'] as string[], {
         favorite: (body['favorite'] as boolean | null) ?? null, archived: (body['archived'] as boolean | null) ?? null,
@@ -404,6 +531,50 @@ export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: Ser
           'This package is not anonymized. Review the records and image metadata before sharing.\n'
         const zipped = zipSync({ ...images, 'records.json': strToU8(JSON.stringify(shared, null, 2)), 'README.txt': strToU8(notice) })
         sendFile(res, zipped, 'application/zip', 'atelier-artworks.zip')
+        return true
+      }
+      if (path === 'gallery/clean-export' && method === 'POST') {
+        const ids = body['ids']
+        if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || !ids.every((v) => typeof v === 'string')) {
+          throw new Error('请选择 1–500 条作品记录')
+        }
+        const cleanMode = (body['mode'] === 'prompts' ? 'prompts' : 'all') as 'all' | 'prompts'
+        const customText = typeof body['custom_text'] === 'string' ? body['custom_text'] : undefined
+        const { zipSync } = await import('fflate')
+        const images: Record<string, Uint8Array> = {}
+        let expandedBytes = 0
+        for (const id of [...new Set(ids as string[])]) {
+          const job = publicJob(wb.store.getJob(id)) as Rec
+          for (const asset of ((job['assets'] ?? []) as Rec[])) {
+            if (typeof asset['path'] === 'string' && asset['path'].toLowerCase().endsWith('.png')) {
+              const raw = await readRegisteredPng(wb, asset['path'])
+              expandedBytes += raw.length
+              if (expandedBytes > 128 * 1024 * 1024) throw new HttpStatus(413, '作品包超过大小限制，请分批导出')
+              const cleaned = cleanPngMetadata(raw, { mode: cleanMode, customText })
+              const name = `artwork-${Object.keys(images).length + 1}.png`
+              images[name] = cleaned
+            }
+          }
+        }
+        if (!Object.keys(images).length) throw new HttpStatus(400, '所选作品没有可脱敏的 PNG 原图')
+        const zipped = zipSync(images)
+        sendFile(res, zipped, 'application/zip', 'atelier-cleaned-artworks.zip')
+        return true
+      }
+      if (path === 'gallery/clean-image' && method === 'POST') {
+        const cleanMode = (body['mode'] === 'prompts' ? 'prompts' : 'all') as 'all' | 'prompts'
+        const customText = typeof body['custom_text'] === 'string' ? body['custom_text'] : undefined
+        let targetPath: string | null = null
+        if (body['asset_id']) {
+          const asset = wb.store.getAsset(String(body['asset_id']))
+          targetPath = String(asset['path'])
+        } else if (body['path']) {
+          targetPath = String(body['path'])
+        }
+        if (!targetPath) throw new HttpStatus(400, '缺少图片路径或 asset_id')
+        const raw = await readRegisteredPng(wb, targetPath)
+        const cleaned = cleanPngMetadata(raw, { mode: cleanMode, customText })
+        sendFile(res, cleaned, 'image/png')
         return true
       }
 
@@ -515,7 +686,13 @@ function stripScheduleRuntime(value: Rec): Rec {
 
 async function testConnection(wb: Workbench, body: Rec): Promise<Rec> {
   const target = String(body['target'] ?? 'nai')
-  if (target === 'nai') return { ok: true, credits: await wb.credits() }
+  if (target === 'nai') {
+    const endpointId = typeof body['endpoint_id'] === 'string' && body['endpoint_id'].trim() ? body['endpoint_id'].trim() : undefined
+    return {
+      ok: true, credits: await wb.credits(endpointId), allowance: await wb.endpointAllowance(endpointId),
+      endpoint: endpointId ?? wb.settings.public()['nai_active_endpoint'],
+    }
+  }
   // AI 构思渠道 = DSH 模型；直接发一个极小补全验证连通。
   return await wb.testAiChannel()
 }

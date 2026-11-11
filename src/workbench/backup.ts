@@ -27,7 +27,7 @@ interface BackupData {
   format: 'dsh-novelai-atelier-backup' | 'nai-atelier-backup'
   version: 1
   created_at: string
-  credentials: false
+  credentials: boolean
   tables: Record<TableKey, Rec[]>
   files: string[]
 }
@@ -168,8 +168,23 @@ export class Backup {
         }
       }
     }
+    // Endpoint tokens are deliberately exported so a backup can move a working
+    // install to another machine; every other occurrence stays redacted.
+    const settingsRow = tables['kv'].find((row) => row['key'] === 'settings')
+    let carriesToken = false
+    if (settingsRow && typeof settingsRow['value'] === 'string') {
+      try {
+        const settingsValue = JSON.parse(settingsRow['value']) as Rec
+        const live = this.wb.settings.raw()
+        settingsValue['nai_endpoints'] = live['nai_endpoints']
+        settingsValue['nai_active_endpoint'] = live['nai_active_endpoint']
+        carriesToken = Array.isArray(live['nai_endpoints'])
+          && (live['nai_endpoints'] as Rec[]).some((entry) => typeof entry['token'] === 'string' && entry['token'] !== '')
+        settingsRow['value'] = encode(settingsValue)
+      } catch { /* a malformed settings row keeps the redacted form */ }
+    }
     const manifest: BackupData = {
-      format: 'dsh-novelai-atelier-backup', version: 1, created_at: timestamp(), credentials: false,
+      format: 'dsh-novelai-atelier-backup', version: 1, created_at: timestamp(), credentials: carriesToken,
       tables, files: [...portableBlobs.keys()],
     }
     const directory = join(this.wb.root, 'backups')
@@ -250,8 +265,8 @@ export class Backup {
       created_at: data.created_at,
       counts: Object.fromEntries(TABLES.map((key) => [key, data.tables[key].length])),
       files: data.files.length,
-      credentials_included: false,
-      note: '恢复会替换本机工作台数据，先自动保存当前备份；恢复后队列暂停、计划停用，进行中的任务标记为需核对。NovelAI 令牌等本机凭据保留，不会从备份导入。',
+      credentials_included: data.credentials === true,
+      note: '恢复会替换本机工作台数据，先自动保存当前备份；恢复后队列暂停、计划停用，进行中的任务标记为需核对。NovelAI 接口（含令牌）会从备份导入，代理、输出目录与 AI 渠道保留本机设置。',
     }
   }
 
@@ -311,6 +326,15 @@ export class Backup {
           if (currentSettings[field] !== undefined) imported[field] = currentSettings[field]
           else delete imported[field]
         }
+        // Connections travel only when the backup actually carries a token;
+        // otherwise restoring a fresh snapshot must not wipe a working setup.
+        const importedEndpoints = imported['nai_endpoints']
+        const carriesToken = Array.isArray(importedEndpoints)
+          && importedEndpoints.some((entry) => entry instanceof Object && typeof (entry as Rec)['token'] === 'string' && (entry as Rec)['token'] !== '')
+        if (!carriesToken) {
+          imported['nai_endpoints'] = currentSettings['nai_endpoints']
+          imported['nai_active_endpoint'] = currentSettings['nai_active_endpoint']
+        }
         imported['ai'] = currentSettings['ai']
         imported['ai_profiles'] = currentSettings['ai_profiles'] ?? {}
         return encode(imported)
@@ -322,9 +346,16 @@ export class Backup {
         if (key === 'settings') {
           // Preserve local connections even when the backup has no usable settings row.
           try {
-            const imported = typeof value === 'string' && value ? walk(JSON.parse(value), '', relocateString, true) : {}
+            const raw = typeof value === 'string' && value ? JSON.parse(value) as Rec : {}
+            const imported = value ? walk(raw, '', relocateString, true) as Rec : {}
             if (!imported || typeof imported !== 'object' || Array.isArray(imported)) throw new Error('Invalid settings row')
-            restored['kv'][key] = preserveLocalSettings(imported as Rec)
+            // The walk drops anything named `token`; the endpoint list is the one
+            // place a backup is expected to carry credentials.
+            if (Array.isArray(raw['nai_endpoints']) && raw['nai_endpoints'].length > 0) {
+              imported['nai_endpoints'] = raw['nai_endpoints']
+              imported['nai_active_endpoint'] = typeof raw['nai_active_endpoint'] === 'string' ? raw['nai_active_endpoint'] : ''
+            }
+            restored['kv'][key] = preserveLocalSettings(imported)
           } catch { restored['kv'][key] = preserveLocalSettings({}) }
         } else {
           const relocated = typeof value === 'string' && value

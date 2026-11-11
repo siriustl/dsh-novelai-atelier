@@ -5,6 +5,7 @@ import { Assistant, AssistantError } from './assistant.ts'
 import type { AssistantContext } from './assistant.ts'
 import { creativeDraft, differences, fixedPrefix } from './schedulePlanner.ts'
 import { lockPath } from './scheduledAssistant.ts'
+import { checkScheduleOutput } from './scheduleOutput.ts'
 
 export async function composeSchedule(wb: Workbench, run: Rec, signal?: AbortSignal): Promise<Rec> {
   signal?.throwIfAborted()
@@ -68,16 +69,21 @@ export async function composeSchedule(wb: Workbench, run: Rec, signal?: AbortSig
   }).planDraft(message)
   signal?.throwIfAborted()
   const candidate = structuredClone(planned['draft']) as Rec
-  const output = candidate['request'] as Rec
+  const output = checkScheduleOutput(schedule, candidate['request'] as Rec)
+  candidate['request'] = output
   output['prompt'] = fixedPrefix(base.fixed_prompt, String(output['prompt'] ?? ''))
   output['negative_prompt'] = fixedPrefix(base.fixed_negative, String(output['negative_prompt'] ?? ''))
   if (base.identities.length) {
-    const characters = (output['characters'] ?? []) as Rec[]
-    if (characters.length < base.identities.length) throw new Error('AI 方案遗漏了已选角色；本次未生成')
+    const baseCharacters = ((draft['request'] as Rec)['characters'] ?? []) as Rec[]
+    const characters = Array.isArray(output['characters']) ? output['characters'] as Rec[] : []
     base.identities.forEach(([prompt, negative], i) => {
-      characters[i]!['prompt'] = fixedPrefix(prompt, String(characters[i]!['prompt'] ?? ''))
-      characters[i]!['negative_prompt'] = fixedPrefix(negative, String(characters[i]!['negative_prompt'] ?? ''))
+      let slot = characters[i]
+      // A dropped slot is restored from the frozen base instead of failing the whole occurrence.
+      if (!(slot instanceof Object) || Array.isArray(slot)) slot = characters[i] = { ...(baseCharacters[i] ?? {}) }
+      slot['prompt'] = fixedPrefix(prompt, String(slot['prompt'] ?? ''))
+      slot['negative_prompt'] = fixedPrefix(negative, String(slot['negative_prompt'] ?? ''))
     })
+    output['characters'] = characters
   }
   const normalizedLocks = locks.map((p) => lockPath(p))
   for (const diff of differences(draft, candidate)) {

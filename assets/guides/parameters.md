@@ -10,6 +10,14 @@ Use one image at a normal size, the selected model's supported default sampler/s
 
 This plugin currently defaults to **23 steps for all four models**, **scale 7 for V5 / 5 for V4.5**, 832×1216, `k_euler_ancestral`, `karras`, `cfg_rescale: 0`, standard quality, heavy UC, and no Variety Boost. V5 only accepts Karras here. V4.5 quality presets are standard/none; light quality is V5-only. Explicit 28-step V4.5 examples are permitted test choices, not a statement of the default. The request preview is the authoritative effective payload, including any model-specific preset expansion.
 
+## V5 Full effort and output categories
+
+`v5_tier: "medium"` is supported only with `model: "nai-diffusion-5-full"`. It selects the distilled Medium API model, fixes steps to 14, sampler to `k_euler_ancestral`, CFG Rescale to zero, and the Heavy undesired-content preset. Custom global and character negative prompts are not sent in this tier. Use `high` (the default) for adjustable settings. The [official 2026-10-08 announcement](https://novelai.net/updates) documents these effort restrictions; the ordinary 23-step defaults below refer to High, not Medium.
+
+`output_subdir` is an optional single directory name relative to the configured image output directory, for example `portraits.v2`. It is per request, including editing and encoding; there is no global default category or automatic SFW/NSFW classifier. Omit it to save directly to the configured directory. Path separators, traversal and reserved device names are rejected rather than silently renamed.
+
+`flat_prompt: true` folds character prompts into the scene prompt while keeping rendered `Text:` content last. It does not add positions or require character slots for a single subject.
+
 ## Automatic presets, like the website
 
 The server automatically adds the selected quality suffix and negative-content template; the caller does not need to paste their text. Start with the defaults when suitable. `nai_get_presets(model=...)` returns every available template in full for that exact model, and `nai_quote` with `offline:true` shows the final compiled text.
@@ -59,11 +67,12 @@ The official free Opus envelope is an eligible single image, normal pixel budget
 
 V5 adds a rechargeable allowance for otherwise free generations. As of the 2026-09-19 FAQ:
 
-- Current default estimates use 23 steps at approximately one megapixel.
-- Roughly 17 generations consume 1% of the bar; a full bar represents roughly 1,730 such images.
-- Published monthly estimate is about 7,000 images under those assumptions, not an unconditional quota.
-- Refill is continuous, approximately 11% per day in the initial period and 14% per day on continued subscriptions; renewal is not an immediate refill.
+- The bar tops out at 100% and refills continuously; there is no daily or monthly reset. Over a month the refill totals roughly 400% of the bar, about four full bars.
+- At the 23-step, roughly one-megapixel default, about 17 generations consume 1% and a full bar is about 1,730 images, so a month is about 7,000. **1% is not one image.**
+- V5 Medium (fixed 14 steps) uses around 42% less usage and Anlas at default settings, so about 30 images per 1% (announced 2026-10-26).
+- Refill is continuous, approximately 11% per day in the first 30 days and 14% per day on continued subscriptions; renewal is not an immediate refill.
 - Resolution and step count both affect drawdown. Exhausting the allowance makes otherwise free V5 generation consume Anlas.
+- On a shared or relay endpoint the workbench takes a carpool size N: V5 allowance is estimated as this pool divided by N (images per bar ÷N, percent per image ×N), while point prices stay 1:1. A quote's `v5` block reports that share and the per-image cost.
 - V4.5 and older models keep the ordinary unlimited eligible Opus generations.
 
 Treat these as human-facing approximations. Do not reconstruct a supposedly authoritative billing algorithm from them. Use live account/limit data when needed; generation does not automatically run a cost guard. Anlas balances are a different pool from V5 free allowance. **There is no 5% minimum.** For V5, a fresh `usage.isNegative: false` can permit otherwise eligible free generation even when the displayed `percent` is 0. A rounded bar percentage is not the exhaustion signal. Negative or unavailable usage must be considered in the quote and paid authorization rather than assumed free.

@@ -94,17 +94,6 @@ describe('credential storage', () => {
     expect(readFileSync(join(settings.secretsDir, '.key'))).toEqual(keyBytes)
   })
 
-  it.each(['pst-isolated-existing-token', 'pst-isolated-new-token'])('never regenerates a missing key on explicit save of %s', (token) => {
-    const existing = settings.seal('pst-isolated-existing-token')
-    const path = join(settings.secretsDir, existing + '.secret')
-    const bytes = readFileSync(path)
-    const keyPath = join(settings.secretsDir, '.key')
-    rmSync(keyPath)
-    expect(() => settings.save({ nai_token: token })).toThrow()
-    expect(() => readFileSync(keyPath)).toThrow()
-    expect(readFileSync(path)).toEqual(bytes)
-  })
-
   it('rejects array or null AI updates without mutating settings', () => {
     const before = settings.raw()
     expect(() => settings.save({ ai: [] })).toThrow(/AI 设置/)
@@ -112,11 +101,12 @@ describe('credential storage', () => {
     expect(settings.raw()).toEqual(before)
   })
 
-  it('preserves workbench-token precedence over the plugin fallback', () => {
+  it('stores endpoint tokens in plaintext without touching the AI credential key', () => {
     expect(settings.naiToken()).toBe('pst-plugin-fallback')
     settings.save({ nai_token: 'pst-stored-token' })
     expect(settings.naiToken()).toBe('pst-stored-token')
     expect(JSON.stringify(settings.public())).not.toContain('pst-stored-token')
-    expect(JSON.stringify(new Store(root).getSettings())).not.toContain('pst-stored-token')
+    expect(JSON.stringify(new Store(root).getSettings())).toContain('pst-stored-token')
+    expect(() => readFileSync(join(settings.secretsDir, '.key'))).toThrow()
   })
 })

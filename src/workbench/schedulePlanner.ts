@@ -1,6 +1,7 @@
 /** Isolated per-occurrence AI composition constraints. Ported from schedule_planner.py (pure parts). */
 import { applyLibrary, entryPrompt } from './library.ts'
 import { lockPath } from './scheduledAssistant.ts'
+import { scheduleRequest } from './scheduleOutput.ts'
 
 type Rec = Record<string, unknown>
 
@@ -15,11 +16,11 @@ function prefix(fixed: string, proposed: string): string {
 export function creativeDraft(schedule: Rec): { draft: Rec; identities: Array<[string, string]>; fixed_prompt: string; fixed_negative: string; chosen: Rec[] } {
   const recipe = (schedule['ai_recipe'] ?? {}) as Rec
   const library = (schedule['ai_library_snapshot'] ?? []) as Rec[]
-  const request = structuredClone(schedule['request']) as Rec
+  const request = scheduleRequest(schedule)
   const operation = schedule['operation'] as string
   if (!['generate', 'img2img', 'inpaint', 'enhance', 'reference_generate'].includes(operation))
     throw new Error('AI 创作计划需要支持提示词的生图操作')
-  const locks = [...new Set(['operation', 'request.model', ...((recipe['locked_fields'] ?? []) as string[])])]
+  const locks = [...new Set(['operation', 'request.model', 'request.output_subdir', ...((recipe['locked_fields'] ?? []) as string[])])]
   let draft: Rec = { id: 'schedule', revision: 0, name: schedule['name'], operation, request, locked_fields: locks, library_refs: [] }
   const index = new Map(library.map((e) => [e['id'] as string, e]))
   let chosen: Array<Rec & { _prompt_set?: number }> = (((recipe['library_refs'] ?? []) as unknown[]) as string[]).map((id) => index.get(id)).filter(Boolean) as Rec[]

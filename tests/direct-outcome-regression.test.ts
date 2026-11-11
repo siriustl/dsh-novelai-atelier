@@ -94,13 +94,13 @@ describe('execution without automatic billing defense', () => {
     expect(client.postOperation).toHaveBeenCalledTimes(2)
   })
 
-  it.each([401, 402, 403, 429])('reports verified HTTP %i rejection as not submitted', async (status) => {
+  it.each([400, 401, 402, 403, 429])('reports verified HTTP %i rejection as a server rejection', async (status) => {
     const { root, executor, prepared, client, receipts } = await setup()
     client.postOperation.mockRejectedValueOnce(httpError(status))
     await expect(executor.execute(prepared, { client })).rejects.toMatchObject({ notSubmitted: true, status_code: status, submission_outcome_unknown: false, partialResult: { anlas_spent: 0 } })
     expect(client.credits).not.toHaveBeenCalled()
     expect(existsSync(join(root, 'billing-review-required.json'))).toBe(false)
-    expect(receipts()[0]).toMatchObject({ status: 'prepared', not_submitted: true, anlas_spent: 0 })
+    expect(receipts()[0]).toMatchObject({ status: 'failed', server_rejected: true, not_submitted: true, anlas_spent: 0 })
   })
 
   it('wraps cancellation before submission without creating a submitted receipt', async () => {

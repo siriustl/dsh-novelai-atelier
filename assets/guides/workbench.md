@@ -4,11 +4,17 @@ NovelAI Atelier is a DeepSeek Harness plugin. The embedded workbench and convers
 
 ## Generate and edit
 
-For an authorized image, use `nai_generate_image({"prompt":"scenery, no humans, forest, morning light"})`. One call waits for the final image; it is not a queue acknowledgement. For multiple images, call sequentially and inspect each result. No separate quote or validation call is required. Ordinary generation defaults to V5; adding nonempty `vibes` or `precise_references` selects reference generation, whose default is V4.5. Explicit models are preserved; references are not silently supported by an incompatible model. Do not mix Vibe and Precise references.
+The call contract (single call returns the final image, sequential calls for several images, optional quote) is in the `novelai-prompting` skill. This topic covers the workbench data model behind those calls: where drafts, library entries, receipts and schedules live, and how to read them back.
 
 Use `nai_edit_image` with required `operation`: `img2img`, `inpaint`, `enhance`, `upscale`, `augment`, or `encode_vibe`. Supply `image_path`, convenient `prompt`/`model` fields, and additional fields in `request`. Inpaint also needs `mask_path` (white repaints, black preserves); augment needs `tool`. Read `nai_get_presets({"operation":"inpaint"})` only when the detailed contract is needed. Nested request fields win over flat fields. `nai_prepare_image` creates local crops, resized images and masks without remote generation.
 
-Generation and remote edits may consume Anlas. Honor the user's scope and approval for paid work. `nai_check_credits` and `nai_quote` are optional information tools. For offline checking use `nai_quote({"offline":true,"operation":"generate","request":{"prompt":"scenery, forest","seed":42}})` and reuse `resolved_request` if preview seed/dimensions matter. A quote does not authorize generation, and unknown cost is not zero.
+Generation and remote edits may consume Anlas. A quote does not authorize generation, and unknown cost is not zero.
+
+Several NovelAI endpoints may be configured (official host or a relay). Choose one deliberately:
+
+- Generation uses the endpoint marked as the Agent default. Pass the top-level `"endpoint":"<id>"` — a sibling of `prompt`, never inside `request` — only when the user asks for another one. There is no automatic failover, so a failure never silently spends on a different endpoint.
+- Only the official host reports a subscription tier and expiry. A relay shows the note, expiry date and carpool size the user typed; the V5 quota arithmetic for that share is in [parameters.md](parameters.md), not repeated here.
+- A relay's V5 percentage appears only when the user configured a site session token for its allowance API; without it the percentage is unknown, not zero. `nai_check_credits` with no `endpoint` returns `{active_endpoint, endpoints}`, and with `endpoint` returns that single entry.
 
 ## Shared drafts
 
@@ -28,7 +34,7 @@ Pass this to `nai_draft`, using the ID/revision just read. Request objects merge
 
 ## Library and gallery
 
-When the user asks to remember/save a reusable character, artist, style or preset, actually use `nai_library_save` rather than promising to remember in conversation. Search `nai_library_read({"query":"Forest watercolor","kind":"preset"})` to avoid duplicates. Styles belong in `preset`; characters use `character`, artists use `artist`, variations use `branch`, and artist mixtures use `blend`.
+When the user asks to remember/save a reusable character, artist, style or preset, actually use `nai_library_save` rather than promising to remember in conversation. Search `nai_library_read({"query":"Forest watercolor","kind":"preset"})` to avoid duplicates; the list response carries `facets.kinds`, `facets.favorites` and `facets.tags`, so one call shows the shape of the library. Styles belong in `preset`; characters use `character`, artists use `artist`, variations use `branch`, and artist mixtures use `blend`. Add `tags` (up to 16) and `favorite` when saving or updating.
 
 Create a reusable style with `nai_library_save`:
 
@@ -50,7 +56,11 @@ Before updating, read `nai_library_read({"id":"actual-entry-id"})` and use its `
 
 Omitted fields retain content, `data` objects merge, arrays replace; explicit empty strings/arrays clear fields. Exact library reads return the full entry, branch parent and `composed_prompt`, including branch inheritance and artist weights. A branch can represent another form, era, role, setting, personality or outfit; do not retain incompatible identity/costume cues. Display names and actual tag strings are separate.
 
-Delete only on user request with `nai_library_save({"action":"delete","id":"actual-entry-id","expected_revision":3})`. `nai_gallery_curate` takes job `ids` and `favorite`/`archived`; `null` leaves a flag unchanged, and generated files are not deleted. Use the workbench UI for browsing, selection, import/export and queue management. Agent tools do not expose durable queue submit/pause/cancel actions.
+Delete only on user request with `nai_library_save({"action":"delete","id":"actual-entry-id","expected_revision":3})`.
+
+To reuse an entry without manually assembling inherited prompts, read the target draft and entry first, then use `nai_draft({"action":"apply_library","draft_id":"actual-draft-id","base_revision":3,"entry_id":"actual-entry-id","expected_entry_revision":2,"prompt_set":-1})`. It saves only the selected draft, checks locked fields and revisions, and never generates or switches the active draft. Use `entry_ids` (1–20, applied in order) to compose several entries with one revision and one save; `expected_entry_revision` and `target_slot` are single-entry only. Character/branch entries use a new character slot by default; `target_slot:0` explicitly replaces slot 0 while retaining its coordinates. For a single-person main-prompt composition, use `composed_prompt` from the exact library read and deliberately update the main prompt instead. Styles/presets append to scene prompts; main presets retain their character slots. The editor exposes branch inheritance, per-group negative prompts and the current composed preview before application.
+
+Use `nai_gallery_read` to search history by prompt, model, character/artist tag, schedule ID, status, favorite/archive and ISO date range; results are paginated and default to a prompt preview plus local image paths. Pass `id` for one exact job. `character_id` matches the saved character's first main-prompt tag inside a work's prompt text; `artist_id` matches the artist's main prompt; both ignore case and must both match when set. This is tag text matching, not provenance. Set `include_recipe:true` only when the user explicitly asks to inspect or restore the exact source recipe. For "replace only the base image", preserve the current draft's prompt, negative prompt and all other request fields; update only `image_path`, preserve an existing `img2img/inpaint/outpaint/enhance/upscale` operation, and use `img2img` otherwise. Full recipe restoration is a separate action and must not be inferred. `nai_gallery_curate` takes job `ids` and `favorite`/`archived`; `null` leaves a flag unchanged, and generated files are not deleted. Use the workbench UI for visual browsing, multi-select and import/export.
 
 ## Image information
 

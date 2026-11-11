@@ -90,11 +90,11 @@ export function DraftsPanel({ state }: { state: WorkbenchState }): Rec {
   return Card({ title: '草稿' },
     ErrorBox({ error }), OkBox({ text: message }),
     h('div', { className: 'nai-row', style: { marginBottom: 10 } },
-      Button({ disabled: busy, onClick: () => void create() }, '＋ 新建草稿'),
-      Button({ disabled: busy, onClick: () => void copy(state.draft!) }, '复制当前'),
-      Button({ disabled: busy, onClick: () => void rename(state.draft!) }, '重命名当前'),
-      Button({ disabled: busy, onClick: () => setVersionOpen(true) }, '保存命名版本'),
-      Button({ kind: 'danger', small: true, disabled: busy, onClick: () => void run(async () => {
+      Button({ icon: 'plus', disabled: busy, onClick: () => void create() }, '新建草稿'),
+      Button({ icon: 'copy', disabled: busy, onClick: () => void copy(state.draft!) }, '复制当前'),
+      Button({ icon: 'edit', disabled: busy, onClick: () => void rename(state.draft!) }, '重命名当前'),
+      Button({ icon: 'save', disabled: busy, onClick: () => setVersionOpen(true) }, '保存命名版本'),
+      Button({ kind: 'danger', icon: 'undo', small: true, disabled: busy, onClick: () => void run(async () => {
         if (!confirm('清空当前草稿的全部参数？如需保留当前内容，请先保存命名版本。')) return
         await api('/draft/reset', 'POST', { revision: state.draft?.['revision'], draft_id: activeId })
         clearPendingDraft(activeId)
@@ -111,8 +111,8 @@ export function DraftsPanel({ state }: { state: WorkbenchState }): Rec {
         h('div', { className: 'grow' },
           h('div', null, h('strong', null, String(draft['name'])), String(draft['id']) === activeId ? h('span', { className: 'nai-tag', style: { marginLeft: 6 } }, '当前') : null),
           h('div', { className: 'sub' }, `${String((draft['request'] as Rec)?.['model'] ?? '')} · ${String((draft['request'] as Rec)?.['prompt'] ?? '').slice(0, 60)}`)),
-        h('button', { type: 'button', disabled: busy, className: 'nai-icon-btn', 'aria-label': '复制草稿', onClick: (e: Rec) => { e.stopPropagation(); void copy(draft) }, title: '复制', style: { cursor: 'pointer', color: 'var(--nai-dim)' } }, '⧉'),
-        h('button', { type: 'button', disabled: busy, className: 'nai-icon-btn', 'aria-label': '删除草稿', onClick: (e: Rec) => { e.stopPropagation(); void remove(draft) }, title: '删除', style: { cursor: 'pointer', color: 'var(--nai-danger)' } }, '✕'),
+        Button({ small: true, iconOnly: true, icon: 'copy', kind: 'ghost', title: '复制草稿', disabled: busy, onClick: (e: Rec) => { (e as any)?.stopPropagation?.(); void copy(draft) } }),
+        Button({ small: true, iconOnly: true, icon: 'trash', kind: 'ghost', title: '删除草稿', disabled: busy, className: 'danger', onClick: (e: Rec) => { (e as any)?.stopPropagation?.(); void remove(draft) } }),
       ))),
     h('h3', { style: { margin: '14px 0 8px', fontSize: 12, color: 'var(--nai-faint)' } }, '命名版本'),
     items.length ? h('div', { className: 'nai-list' }, items.map((version) =>

@@ -58,10 +58,10 @@ describe('NAI preset capability isolation', () => {
       const normal = createScope(ctx, normalKey)
       const child = createScope(ctx, childKey, { parent: naiKey })
       await nai.ctx.plugin(agentEntry)
-      await vi.waitFor(() => expect(ctx.tools.schemas(naiKey)).toHaveLength(15))
+      await vi.waitFor(() => expect(ctx.tools.schemas(naiKey)).toHaveLength(16))
       expect(ctx.tools.schemas(normalKey)).toHaveLength(0)
-      expect(ctx.tools.schemas(childKey)).toHaveLength(15)
-      expect(new Set(ctx.tools.schemas(naiKey).map((tool) => tool.name)).size).toBe(15)
+      expect(ctx.tools.schemas(childKey)).toHaveLength(16)
+      expect(new Set(ctx.tools.schemas(naiKey).map((tool) => tool.name)).size).toBe(16)
       expect(skills.register).toHaveBeenCalledOnce()
       expect(skills.active.size).toBe(1)
       expect(nai.ctx.get('naiAtelier')?.workbench).toBe(wb)
@@ -95,14 +95,14 @@ describe('NAI preset capability isolation', () => {
     try {
       await ctx.plugin(ToolRuntime, {})
       await ctx.plugin(host, config)
-      await vi.waitFor(() => expect(ctx.tools.schemas()).toHaveLength(15))
+      await vi.waitFor(() => expect(ctx.tools.schemas()).toHaveLength(16))
       const key = {}
       const scope = createScope(ctx, key)
       await scope.ctx.plugin(agentEntry)
-      expect(ctx.tools.schemas(key)).toHaveLength(15)
+      expect(ctx.tools.schemas(key)).toHaveLength(16)
       expect(skills.register).toHaveBeenCalledOnce()
       await scope.dispose()
-      expect(ctx.tools.schemas()).toHaveLength(15)
+      expect(ctx.tools.schemas()).toHaveLength(16)
     } finally { await ctx.fiber.dispose() }
   })
 

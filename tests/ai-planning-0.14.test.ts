@@ -71,6 +71,10 @@ describe('bounded assistant planning', () => {
     ctx.getDraft = () => ({ ...original(), locked_fields: ['prompt'] })
     await expect(new Assistant(ctx, { maxRounds: 1 }).planDraft('Compose.')).rejects.toThrow(/未返回/)
   })
+  it('reports the host channel failure reason instead of a bare error name', async () => {
+    await expect(new Assistant(context(async () => { throw new Error('provider 429: slow down') })).planDraft('Compose.'))
+      .rejects.toThrow(/AI 渠道调用失败：provider 429/)
+  })
 })
 
 describe('assistant generation without monetary defense', () => {
@@ -172,6 +176,18 @@ describe('scheduled model cancellation', () => {
     expect(run.usage).toEqual([{ inputTokens: 123, outputTokens: 25 }])
     expect(run.planning_metrics).toMatchObject({ guide_topics: ['prompting'], provider_calls: 1, estimation: true })
     expect(wb.store.getSchedule(String(schedule.id)).enabled).toBe(false)
+  })
+  it('records the host channel failure in the schedule run instead of a bare Error name', async () => {
+    const wb = new Workbench(root())
+    wb.setDshLlm({ complete: async () => { throw new Error('模型渠道不支持工具调用') }, describe: async () => ({}), catalog: async () => ({}), vision: false })
+    const schedule = wb.store.saveSchedule({ name: 'channel', kind: 'once', at: '2026-10-01T00:00:00Z', missed_policy: 'once', execution_mode: 'ai', request,
+      operation: 'generate', ai_recipe: { instruction: 'Scenery' }, max_runs: 1 })
+    await wb.worker.tick('2026-10-01T00:00:00Z')
+    const run = wb.store.listScheduleRuns(String(schedule.id))[0]!
+    expect(run.outcome).toBe('failed')
+    expect(String(run.error)).toContain('模型渠道不支持工具调用')
+    expect(String(run.error)).not.toContain('(Error)')
+    wb.stop()
   })
 })
 

@@ -2,6 +2,9 @@
 import { randomInt } from 'node:crypto'
 import { z } from 'zod'
 import { modelSpec } from './specs.ts'
+import { OutputSubdirSchema } from './outputDirectory.ts'
+import { splitPromptText } from './promptText.ts'
+export { splitPromptText } from './promptText.ts'
 
 export const MODEL_IDS = ['nai-diffusion-5-full', 'nai-diffusion-5-curated', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated'] as const
 export const SAMPLERS = ['k_euler_ancestral', 'k_euler', 'k_dpmpp_2s_ancestral', 'k_dpmpp_2m', 'k_dpmpp_sde'] as const
@@ -16,6 +19,9 @@ export const CharacterSchema = z.object({
 
 export const GenerationRequestSchema = z.object({
   model: z.enum(MODEL_IDS).default('nai-diffusion-5-full'),
+  v5_tier: z.enum(['high', 'medium']).default('high'),
+  flat_prompt: z.boolean().default(false),
+  output_subdir: OutputSubdirSchema.nullable().optional(),
   prompt: z.string().min(1).max(50000),
   negative_prompt: z.string().max(50000).default(''),
   width: z.number().int().min(64).max(4096).multipleOf(64).default(832),
@@ -37,21 +43,17 @@ export const GenerationRequestSchema = z.object({
 export type GenerationRequest = z.infer<typeof GenerationRequestSchema>
 export type CharacterInput = z.infer<typeof CharacterSchema>
 
-/** The official client accepts Text:/text:/teXt: at these boundaries, but not e.g. "context:" or "text::". */
-const TEXT_BLOCK_RE = /(?:^|(?<=[\s,.[\]:{}、。]))text:(?!:)/i
-
-export function splitPromptText(prompt: string): [string, string | null] {
-  const match = TEXT_BLOCK_RE.exec(prompt)
-  if (!match) return [prompt, null]
-  return [prompt.slice(0, match.index).replace(/[ ,\n]+$/u, ''), prompt.slice(match.index + match[0].length).trim()]
-}
-
 export function isV5(model: string): boolean { return model.startsWith('nai-diffusion-5-') }
-export function effectiveSteps(r: GenerationRequest): number { return r.steps ?? 23 }
+export function isV5Medium(r: { model: string; v5_tier?: string }): boolean { return isV5(r.model) && r.v5_tier === 'medium' }
+export function effectiveSteps(r: GenerationRequest): number {
+  if (isV5Medium(r)) return 14
+  return r.steps ?? 23
+}
 export function effectiveScale(r: GenerationRequest): number { return r.scale ?? (isV5(r.model) ? 7 : 5) }
 
 /** Model-specific validation beyond the base schema. Throws Error with a user-facing message. */
 export function validateRequest(r: GenerationRequest): void {
+  if (r.v5_tier === 'medium' && r.model !== 'nai-diffusion-5-full') throw new Error('V5 Medium is only available for V5 Full')
   if (!r.prompt.trim()) throw new Error('Prompt must contain visible text')
   if (!isV5(r.model) && r.characters.length > 6) throw new Error('V4.5 supports up to 6 character prompts')
   if (isV5(r.model) && r.variety_boost) throw new Error('Variety Boost is a V4.5 option, not a V5 option')
@@ -82,8 +84,19 @@ export function compileRequest(r: GenerationRequest): { payload: Record<string, 
   const warnings: string[] = []
   const spec = modelSpec(r.model)
   const [strippedPrompt, explicitText] = splitPromptText(r.prompt.trim())
+  let basePrompt = strippedPrompt
+  let baseNegative = isV5Medium(r) ? '' : r.negative_prompt
+  let activeCharacters = r.characters
+  if (r.flat_prompt && r.characters.length > 0) {
+    const charPrompts = r.characters.map((c) => c.prompt.trim()).filter(Boolean)
+    const charUcs = isV5Medium(r) ? [] : r.characters.map((c) => c.negative_prompt.trim()).filter(Boolean)
+    basePrompt = [basePrompt, ...charPrompts].filter(Boolean).join(', ')
+    baseNegative = [baseNegative, ...charUcs].filter(Boolean).join(', ')
+    activeCharacters = []
+  }
+
   const textBlock = r.text ?? explicitText
-  let prompt = strippedPrompt
+  let prompt = basePrompt
   let quality = ''
   if (r.quality_preset !== 'none') {
     quality = spec.quality_presets.find((p) => p.id === r.quality_preset)?.suffix ?? ''
@@ -94,17 +107,17 @@ export function compileRequest(r: GenerationRequest): { payload: Record<string, 
   if (r.transparent_background) quality = [ 'transparent background', quality ].filter(Boolean).join(', ')
   if (quality) prompt = [prompt, quality].filter(Boolean).join(', ')
   if (textBlock) prompt += `\nText: ${textBlock}`
-  const ucUser = r.negative_prompt.trim()
+  const ucUser = baseNegative.trim()
   let prefix = spec.uc_presets.find((p) => p.id === r.negative_preset)?.prefix ?? ''
   if (prefix && r.model.endsWith('full') && !prompt.toLowerCase().includes('nsfw')) prefix = 'nsfw, ' + prefix
   const uc = [prefix, ucUser].filter(Boolean).join(', ')
   // Conservative lexical diagnostics: never rewrite user text or official presets.
-  const positiveStrings: string[] = [splitPromptText(r.prompt)[0], ...r.characters.map((c) => c.prompt)]
+  const positiveStrings: string[] = [splitPromptText(basePrompt)[0], ...activeCharacters.map((c) => c.prompt)]
   if (r.transparent_background) positiveStrings.push('transparent background')
   const positiveTerms = new Set<string>()
   for (const s of positiveStrings) for (const t of plainTerms(s)) positiveTerms.add(t)
   const negativeTerms = plainTerms(prefix)
-  for (const t of plainTerms(r.negative_prompt)) negativeTerms.add(t)
+  for (const t of plainTerms(baseNegative)) negativeTerms.add(t)
   const conflicts = [...positiveTerms].filter((t) => negativeTerms.has(t)).sort()
   if (conflicts.length)
     warnings.push('Positive tags also occur in global undesired content: ' + conflicts.join(', ') +
@@ -112,12 +125,12 @@ export function compileRequest(r: GenerationRequest): { payload: Record<string, 
   if (textBlock && positiveTerms.has('no text'))
     warnings.push('Rendered text was supplied, but the user prompt still includes no text. Only the automatic no text suffix is removed; edit the conflicting user tag if unintended.')
 
-  const useCoords = r.characters.some((c) => c.x != null)
-  if (useCoords && r.characters.some((c) => c.x == null))
-    throw new Error('When positioning characters explicitly, provide coordinates for every character')
+  const useCoords = activeCharacters.some((c) => c.x != null || c.y != null)
+  if (useCoords && activeCharacters.some((c) => c.x == null || c.y == null))
+    throw new Error('When positioning characters explicitly, provide both x and y coordinates for every character')
   const positives: unknown[] = []
   const negatives: unknown[] = []
-  for (const c of r.characters) {
+  for (const c of activeCharacters) {
     let x = c.x ?? 0.5
     let y = c.y ?? 0.5
     if (useCoords && !isV5(r.model)) {
@@ -150,7 +163,23 @@ export function compileRequest(r: GenerationRequest): { payload: Record<string, 
   if (isV5(r.model)) {
     params.straight_alpha = true
     if (r.transparent_background) params.tag_hint_transparent_background = true
+    if (isV5Medium(r)) {
+      params.steps = 14
+      params.sampler = 'k_euler_ancestral'
+      params.cfg_rescale = 0
+      params.ucPresetId = 'heavy'
+      params.tag_hint_uc_preset = 2
+      let heavyPrefix = spec.uc_presets.find((p) => p.id === 'heavy')?.prefix ?? ''
+      if (r.model.endsWith('full') && !prompt.toLowerCase().includes('nsfw')) heavyPrefix = 'nsfw, ' + heavyPrefix
+      const mediumUc = heavyPrefix
+      params.negative_prompt = mediumUc
+      ;(params.v4_negative_prompt as Record<string, any>).caption.base_caption = mediumUc
+      const negCaptions = (params.v4_negative_prompt as Record<string, any>).caption.char_captions as Array<{ char_caption: string; centers: unknown[] }>
+      for (const item of negCaptions) item.char_caption = ''
+      warnings.push('V5 Medium active: fixed 14 steps, Euler Ancestral, heavy negative preset; custom global and character negative prompts suppressed.')
+    }
   }
   if (r.variety_boost) params.skip_cfg_above_sigma = 58 * (r.width * r.height / (832 * 1216)) ** 0.5
-  return { payload: { input: prompt, model: r.model, action: 'generate', parameters: params }, warnings }
+  const model = isV5Medium(r) ? 'nai-diffusion-5-full-medium' : r.model
+  return { payload: { input: prompt, model, action: 'generate', parameters: params }, warnings }
 }

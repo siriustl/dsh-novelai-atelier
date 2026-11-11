@@ -324,7 +324,10 @@ export class Assistant {
       catch (error) {
         this.checkpoint()
         if (timeout.aborted) throw new AssistantError('AI 服务响应超时；未自动重试。')
-        throw error
+        if (error instanceof AssistantError || error instanceof AssistantCancelled) throw error
+        // The host channel reports provider failures as plain errors; keep the reason instead of a bare name.
+        const detail = String((error as Error)?.message ?? '').slice(0, 400) || (error as Error)?.name || '未知错误'
+        throw new AssistantError(`AI 渠道调用失败：${detail}`)
       }
       this.checkpoint()
       if (result['usage'] instanceof Object) {
@@ -626,7 +629,8 @@ export class Assistant {
             ok = false
             outcome = error instanceof AssistantError
               ? { error: String(clean((error as Error).message, '', apiKey)).slice(0, 1500) }
-              : { error: '工具参数或操作无效，请检查参数与草稿。' }
+              // Schema and validation failures carry the exact field; returning them lets the model correct it.
+              : { error: '工具参数或操作无效：' + String(clean(String((error as Error)?.message ?? ''), '', apiKey)).slice(0, 1500) }
           }
           let output = JSON.stringify(clean(outcome, '', apiKey))
           if (output.length > 24000) output = JSON.stringify({ summary: output.slice(0, 23500), truncated: true })
@@ -698,7 +702,9 @@ export class Assistant {
       requireProposal: true,
     })
     const changed = mergeDraftPatch(draft, (result['proposal'] as Rec)['patch'] as Rec)
-    const validation = await this.context.validate(String(changed['operation']), changed['request'] as Rec)
+    let validation: Rec
+    try { validation = await this.context.validate(String(changed['operation']), changed['request'] as Rec) }
+    catch (error) { throw new AssistantError('AI 规划参数未通过验证：' + String((error as Error)?.message ?? '').slice(0, 1500)) }
     if (validation['valid'] === false) throw new AssistantError('AI 规划参数未通过验证，本次未提交生成。')
     if (result['cancelled'] === true) throw new AssistantCancelled('AI 规划已停止，本次未提交生成。')
     return { draft: changed, proposal: result['proposal'], reply: result['reply'], tool_steps: result['tool_steps'], usage: result['usage'] }

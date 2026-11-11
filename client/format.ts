@@ -14,3 +14,16 @@ export function dateTimeLabel(value: unknown): string {
   const date = numeric === null ? new Date(String(value)) : new Date(numeric < 1e12 ? numeric * 1000 : numeric)
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN')
 }
+
+/** Compact relative label for dense gallery metadata; absolute dates remain in tooltips. */
+export function relativeTimeLabel(value: unknown): string {
+  if (value == null || value === '') return '—'
+  const date = new Date(String(value))
+  if (Number.isNaN(date.getTime())) return '—'
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000)
+  if (seconds < 60) return '刚刚'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
+  if (seconds < 86400 * 7) return `${Math.floor(seconds / 86400)} 天前`
+  return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}

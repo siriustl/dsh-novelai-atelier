@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import sharp from 'sharp'
@@ -57,6 +57,20 @@ describe('image formats and resource limits', () => {
 })
 
 describe('direct executor cancellation', () => {
+  it('records the active endpoint on an implicit call', async () => {
+    const root = temporary()
+    const client: any = { credits: vi.fn(), postOperation: vi.fn().mockResolvedValue(encodePng(64, 64, new Uint8Array(64 * 64 * 4).fill(255))) }
+    const executor = new OperationExecutor({
+      target: (id?: string) => ({ id: id ?? 'ep_relay', baseUrl: 'https://relay.example/v1', token: 'pst-test' }),
+      token: () => 'pst-test', baseUrl: () => 'https://relay.example/v1', proxy: () => null,
+      outputDir: () => root, dataDir: () => root,
+    }, { run: async (fn) => fn() })
+    const prepared = await prepareOperation({ prompt: 'tree', width: 64, height: 64, max_anlas: 0 }, 'generate')
+    const result = await executor.execute(prepared, { client })
+    expect(result).toMatchObject({ status: 'generated', endpoint_id: 'ep_relay' })
+    expect(JSON.parse(readFileSync(String(result['record_path']), 'utf8'))).toMatchObject({ endpoint_id: 'ep_relay' })
+  })
+
   it('retains unknown submission without billing queries or blocking later operations', async () => {
     const root = temporary()
     const controller = new AbortController()

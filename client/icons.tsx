@@ -1,5 +1,5 @@
 /** Shared Lucide symbols; React is provided by the host module factory. */
-import { Brush, Image, Layers, SlidersHorizontal, Sparkles, Library, Files, Calendar, Settings2, Play, Pause, Plus, Trash2, Pencil, Copy, Save, RefreshCw, Download, Upload, X, Undo2, Eraser, Check, AlertTriangle, Coins, Maximize2, Search, ChevronLeft, ChevronRight, List, Users, FolderOpen, Eye, LoaderCircle, Clock, Star, Grid2X2, Columns2 } from 'lucide-react'
+import { Brush, Image, Layers, SlidersHorizontal, Sparkles, Library, Files, Calendar, Settings2, Play, Pause, Plus, Trash2, Pencil, Copy, Save, RefreshCw, Download, Upload, X, Undo2, Eraser, Check, AlertTriangle, Coins, Maximize2, Search, ChevronLeft, ChevronRight, List, Users, FolderOpen, Eye, LoaderCircle, Clock, Star, Grid2X2, Columns2, Shield, Minus, Scan, Tag } from 'lucide-react'
 import { createElement } from 'react'
 import type { Rec } from './api.ts'
 
@@ -11,6 +11,7 @@ const symbols = {
   alert: AlertTriangle, coins: Coins, expand: Maximize2, search: Search,
   previous: ChevronLeft, next: ChevronRight, list: List, users: Users, folder: FolderOpen,
   eye: Eye, loader: LoaderCircle, clock: Clock, star: Star, grid: Grid2X2, columns: Columns2,
+  shield: Shield, minus: Minus, scan: Scan, tag: Tag,
 } as const
 export type IconName = keyof typeof symbols
 
@@ -22,11 +23,12 @@ export function commandPresentation(text: string): { label: string; icon?: IconN
   const prefixes: Array<[string, IconName]> = [
     ['＋', 'plus'], ['⬇', 'download'], ['⬆', 'upload'], ['✎', 'edit'], ['⧉', 'copy'],
     ['⤵', 'copy'], ['▶', 'play'], ['⏸', 'pause'], ['⏱', 'clock'], ['☰', 'list'],
-    ['📋', 'copy'], ['🎨', 'image'], ['🖌️', 'brush'], ['🔍', 'expand'], ['👤', 'users'],
+    ['📋', 'copy'], ['🎨', 'image'], ['🖌️', 'brush'], ['📐', 'expand'], ['🔍', 'expand'], ['👤', 'users'],
     ['⚙', 'sliders'], ['★', 'star'], ['☆', 'star'], ['✕', 'close'],
+    ['🛡️', 'shield'], ['🛡', 'shield'], ['⚠', 'alert'],
   ]
   const candidate = prefixes.find(([value]) => text.startsWith(value))
-  const commandPrefix = /^(?:新建|添加|上传|选择|导出|导入|编辑|复制|分支|从资料库|画师混合|立即执行|执行记录|暂停|启用|填入草稿|绘制|准备画布|保存|应用|发送|查看|存为|下载|取消|收藏|本体|角色本体)/u
+  const commandPrefix = /^(?:新建|添加|上传|选择|导出|导入|编辑|复制|分支|从资料库|画师混合|立即执行|执行记录|暂停|启用|填入草稿|绘制|准备画布|保存|应用|发送|查看|存为|下载|取消|收藏|本体|角色本体|脱敏|恢复)/u
   const prefix = candidate && commandPrefix.test(text.slice(candidate[0].length).trimStart()) ? candidate : undefined
   const label = (prefix ? text.slice(prefix[0].length).trimStart() : text).replace(/\s+▸$/u, '')
   const commands: Array<[RegExp, IconName]> = [

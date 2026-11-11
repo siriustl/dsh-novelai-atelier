@@ -118,6 +118,10 @@ export class WorkspaceActions {
     } else if (action.startsWith('schedules.') && action !== 'schedules.delete') {
       const supplied = args['schedule'] as Rec
       const source = { ...(before ?? {}), ...supplied } as Rec
+      const suppliedRequest = supplied['request']
+      const requestDirectoryPatch = !('output_subdir' in supplied) && suppliedRequest instanceof Object && 'output_subdir' in suppliedRequest
+      // Freeze legacy request-only patches before AI normalization can remove a cleared field.
+      if (requestDirectoryPatch) source['output_subdir'] = suppliedRequest['output_subdir']
       if (before === null) source['enabled'] ??= false
       this.knownPaths(source['request'] ?? {})
       let prepared = await this.wb.prepareScheduleData(source, false) as Rec
@@ -128,6 +132,7 @@ export class WorkspaceActions {
       args['schedule'] = Object.fromEntries(Object.entries(prepared).filter(([k]) =>
         !['id', 'snapshot', 'context', 'created_at', 'updated_at', 'runs', 'spent', 'reserved', 'next_run', 'revision'].includes(k)
         && (before === null || k in supplied)))
+      if (requestDirectoryPatch) (args['schedule'] as Rec)['output_subdir'] = after['output_subdir']
       ;if (before) (args['schedule'] as Rec)['revision'] = before['revision']
       summary = `${after['name']}：${after['enabled'] ? '开启' : '暂不启用'}；每次 ${after['count']} 张，最多 ${after['max_runs']} 次`
     } else if (action.startsWith('draft.')) {

@@ -59,7 +59,9 @@ async function harness(definition, expectedBroken) {
       if (key === 'then' || key === 'sandboxMode' || key === 'defaultSandboxMode' || key === 'sandboxDefaultMode') return undefined
       return (...args) => { called.push(`${name}.${String(key)}`); throw new Error(`Unexpected host backend invocation ${name}.${String(key)}`) }
     } }))
-    const draft = { id: 'probe-draft', revision: 0, operation: 'generate', request: { prompt: '' } }
+    // DSH 0.2.1-rc2 requires this service for filesystem, skill, and presentation rows.
+     ctx.provide('workingDirectory', { ensure: async () => project })
+     const draft = { id: 'probe-draft', revision: 0, operation: 'generate', request: { prompt: '' } }
     ctx.provide('naiAtelier', { toolExposure: 'scoped', workbench: { store: { getDraft: () => draft } } })
     await ctx.plugin(Registry, { default: 'ordinary' })
     const ordinaryDispose = await ctx.agentPresets.register({ id: 'ordinary', name: 'Ordinary', plugins: [] })
@@ -82,7 +84,7 @@ async function harness(definition, expectedBroken) {
       const ordinary = await ctx.agentPresets.acquireScope('ordinary')
       try {
         const names = ctx.tools.schemas(lease.key).map(t => t.name)
-        assert.equal(names.filter(n => n.startsWith('nai_')).length, 15)
+        assert.equal(names.filter(n => n.startsWith('nai_')).length, 16)
         for (const name of ['read', 'write', 'edit', 'glob', 'grep', 'skill', 'ask_user_question', 'present']) assert.ok(names.includes(name), name)
         assert.equal(new Set(names).size, names.length)
         assert.equal(ctx.tools.schemas(ordinary.key).filter(t => t.name.startsWith('nai_')).length, 0)
@@ -97,7 +99,7 @@ async function harness(definition, expectedBroken) {
         try {
           await ctx.agentPresets.mount(bound.ctx, 'nai')
           assert.equal(ctx.agentPresets.composeFrom(child.ctx, bound.ctx), 'nai')
-          assert.equal(ctx.tools.schemas(scope.scopeOf(child.ctx)).filter(t => t.name.startsWith('nai_')).length, 15)
+          assert.equal(ctx.tools.schemas(scope.scopeOf(child.ctx)).filter(t => t.name.startsWith('nai_')).length, 16)
           const result = await ctx.tools.get('nai_draft', scope.scopeOf(bound.ctx)).execute({ action: 'read' }, { signal: new AbortController().signal })
           assert.equal(result.id, draft.id)
           const compaction = ctx.agentPresets.serviceFor({ ctx: bound.ctx }, 'compaction')
@@ -108,9 +110,9 @@ async function harness(definition, expectedBroken) {
           const assembly = await ctx.systemPrompt.assemble({ scope: scope.scopeOf(bound.ctx) })
           assert.ok(assembly.sections.some(section => section.text.includes('NovelAI image creation assistant')))
           record.active_tool_count = names.length
-          record.nai_tool_count = 15
+          record.nai_tool_count = 16
           record.ordinary_nai_tools = 0
-          record.descendant_nai_tools = 15
+          record.descendant_nai_tools = 16
           record.shared_draft_read = true
           record.services_isolated = true
           record.prompt_composed = true

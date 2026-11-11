@@ -61,6 +61,16 @@ describe('simplified default tools', () => {
     expect(execute).not.toHaveBeenCalled()
   })
 
+  it('returns a gallery job id without composing library entries into the request', async () => {
+    const { prepare } = mockRemote()
+    vi.spyOn(wb, 'registerDirectGeneration').mockResolvedValue({ id: 'gallery-job-1' } as never)
+    const result = await run('nai_generate_image', { prompt: 'forest' })
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'forest', model: 'nai-diffusion-5-full' }), 'generate')
+    expect(result).toMatchObject({ gallery_job_id: 'gallery-job-1' })
+    expect(tools.get('nai_generate_image').parameters).not.toHaveProperty('library_entry_id')
+    expect(tools.get('nai_edit_image').parameters).not.toHaveProperty('library_entry_id')
+  })
+
   it('generates once with V5 defaults and no prerequisite credits or quote call', async () => {
     const { prepare, execute } = mockRemote()
     const credits = vi.spyOn(wb.executor, 'credits')

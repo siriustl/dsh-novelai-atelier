@@ -18,6 +18,8 @@ export interface DecodedPng {
   mode: string
 }
 
+const MAX_PNG_METADATA_BYTES = 4 * 1024 * 1024
+
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256)
   for (let n = 0; n < 256; n++) {
@@ -80,6 +82,7 @@ export function decodePng(input: Uint8Array): DecodedPng {
   let trns: Buffer | undefined
   let grayTrns: number | undefined
   const text: PngText[] = []
+  let metadataBytes = 0
   let iccProfile: Uint8Array | undefined
   let phys: DecodedPng['phys'] | undefined
   let pos = 8
@@ -97,12 +100,24 @@ export function decodePng(input: Uint8Array): DecodedPng {
     } else if (type === 'PLTE') palette = Buffer.from(data)
     else if (type === 'tRNS') trns = Buffer.from(data)
     else if (type === 'IDAT') idat.push(Buffer.from(data))
-    else if (type === 'tEXt') { const t = decodeText(data, 'tEXt'); if (t) text.push(t) }
-    else if (type === 'zTXt') { const t = decodeText(data, 'zTXt'); if (t) text.push(t) }
-    else if (type === 'iTXt') { const t = decodeText(data, 'iTXt'); if (t) text.push(t) }
+    else if (type === 'tEXt' || type === 'zTXt' || type === 'iTXt') {
+      if (len > MAX_PNG_METADATA_BYTES) throw new Error('PNG metadata exceeds the 4 MiB limit')
+      const t = decodeText(data, type)
+      if (t) {
+        metadataBytes += Buffer.byteLength(t.keyword) + Buffer.byteLength(t.text) + Buffer.byteLength(t.lang ?? '') + Buffer.byteLength(t.translatedKeyword ?? '')
+        if (metadataBytes > MAX_PNG_METADATA_BYTES) throw new Error('PNG metadata exceeds the 4 MiB limit')
+        text.push(t)
+      }
+    }
     else if (type === 'iCCP') {
       const nul = data.indexOf(0)
-      if (nul > 0 && data[nul + 1] === 0) { try { iccProfile = inflateSync(data.subarray(nul + 2), { maxOutputLength: 4 * 1024 * 1024 }) } catch { /* ignore */ } }
+      if (nul > 0 && data[nul + 1] === 0) {
+        try {
+          iccProfile = inflateSync(data.subarray(nul + 2), { maxOutputLength: MAX_PNG_METADATA_BYTES })
+          metadataBytes += iccProfile.length
+        } catch { /* ignore malformed or oversized profiles */ }
+        if (metadataBytes > MAX_PNG_METADATA_BYTES) throw new Error('PNG metadata exceeds the 4 MiB limit')
+      }
     } else if (type === 'pHYs' && len >= 9) {
       phys = { x: data.readUInt32BE(0), y: data.readUInt32BE(4), unit: data[8]! }
     } else if (type === 'IEND') break
@@ -290,4 +305,65 @@ export function stealthMetadata(width: number, height: number, rgba: Uint8Array,
   } catch {
     return null
   }
+}
+
+export interface CleanPngOptions {
+  mode: 'all' | 'prompts'
+  customText?: string
+}
+
+const SAFE_METADATA_STRINGS = new Set(['model', 'sampler', 'noise_schedule', 'image_format', 'request_type', 'qualitypresetid', 'ucpresetid'])
+
+function redactPromptMetadata(value: unknown, depth = 0): unknown {
+  if (depth > 64) return null
+  if (Array.isArray(value)) return value.map((item) => redactPromptMetadata(item, depth + 1))
+  if (!value || typeof value !== 'object') return typeof value === 'string' ? undefined : value
+  const entries: Array<[string, unknown]> = []
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replace(/[_ -]/gu, '')
+    if (normalized === 'basecaption' || normalized === 'charcaption') {
+      entries.push([key, ''])
+    } else if (/prompt|caption|description|comment|^uc$|^text$/u.test(normalized)
+      && !['v4prompt', 'v4negativeprompt', 'caption', 'charcaptions'].includes(normalized)) {
+      continue
+    } else if (typeof item !== 'string' || SAFE_METADATA_STRINGS.has(key.toLowerCase())) {
+      entries.push([key, typeof item === 'string' ? item : redactPromptMetadata(item, depth + 1)])
+    }
+  }
+  return Object.fromEntries(entries)
+}
+
+/** Clean standard chunks and the alpha low-bit channel. Unknown text is not safe to share. */
+export function cleanPngMetadata(input: Uint8Array, options: CleanPngOptions): Buffer {
+  if (options.mode !== 'all' && options.mode !== 'prompts') throw new Error('Invalid PNG metadata cleaning mode')
+  const decoded = decodePng(input)
+  const hidden = options.mode === 'prompts' ? stealthMetadata(decoded.width, decoded.height, decoded.data) : null
+  const data = new Uint8Array(decoded.data)
+
+  // Clear every alpha low bit, including transparent images, without flattening their alpha.
+  for (let i = 3; i < data.length; i += 4) data[i] = data[i]! >= 254 ? 255 : data[i]! & 254
+
+  const text: PngText[] = []
+  if (options.mode === 'prompts') {
+    const hiddenText = Object.entries(hidden ?? {}).map(([keyword, value]) => ({ keyword, text: typeof value === 'string' ? value : JSON.stringify(value) }))
+    // Prefer ordinary metadata, but recover hidden-only safe parameters before erasing the bits.
+    const ordinaryKeywords = new Set(decoded.text.map((item) => item.keyword.toLowerCase()))
+    const candidates = [...decoded.text, ...hiddenText.filter((item) => !ordinaryKeywords.has(item.keyword.toLowerCase()))]
+    for (const item of candidates) {
+      const keyword = item.keyword.toLowerCase()
+      if (keyword === 'comment') {
+        try {
+          const parsed: unknown = JSON.parse(item.text)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            text.push({ keyword: 'Comment', text: JSON.stringify(redactPromptMetadata(parsed)) })
+          }
+        } catch { /* Unparseable comments may contain prompts: discard, never forward raw. */ }
+      } else if (keyword === 'software' || keyword === 'source') {
+        text.push({ keyword: keyword === 'software' ? 'Software' : 'Source', text: item.text })
+      }
+    }
+  }
+
+  if (options.customText?.trim()) text.push({ keyword: 'Description', text: options.customText.trim() })
+  return encodePng(decoded.width, decoded.height, data, { text, phys: decoded.phys })
 }

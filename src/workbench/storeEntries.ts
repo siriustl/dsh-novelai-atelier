@@ -1,30 +1,237 @@
 /** Store part: entry library, asset library, portable import. Ported from store.py entries/assets + import_entries. */
+import type { EntryRow } from './storeDoc.ts'
 import type { Store, Rec } from './store.ts'
 import { ConflictError, KeyError, encode, integer, nowStamp, randomId, timestamp } from './util.ts'
 import { ENTRY_KINDS } from './storeDoc.ts'
 
+/** Library display order; also the order of the type chips in the workbench. */
+export const ENTRY_KIND_ORDER = ['character', 'branch', 'artist', 'blend', 'preset'] as const
+export const ENTRY_TAG_LIMIT = 16
+export const ENTRY_TAG_MAX_LENGTH = 32
+export const ENTRY_QUERY_LIMIT = 100
+export const ENTRY_QUERY_DEFAULT = 48
+const ENTRY_SORTS = ['updated', 'created', 'name', 'used', 'favorite', 'kind'] as const
+
+interface EntryMeta {
+  tags: string[]
+  favorite: boolean
+  use_count: number
+  last_used_at: string | null
+}
+
+interface CachedEntry {
+  encoded: string
+  data: Rec
+  meta: EntryMeta
+  ownText: string
+}
+
+export interface EntryQuery {
+  query?: string
+  kind?: string | null
+  tag?: string | null
+  favorite?: boolean
+  sort?: string
+  offset?: number
+  limit?: number
+}
+
+function entryMeta(input: unknown): EntryMeta {
+  const value = input instanceof Object && !Array.isArray(input) ? input as Rec : {}
+  const tags = Array.isArray(value['tags'])
+    ? value['tags'].filter((tag): tag is string => typeof tag === 'string').map((tag) => tag.trim()).filter(Boolean)
+    : []
+  const useCount = Number(value['use_count'])
+  return {
+    tags: [...new Set(tags)].slice(0, ENTRY_TAG_LIMIT),
+    favorite: value['favorite'] === true,
+    use_count: Number.isSafeInteger(useCount) && useCount > 0 ? useCount : 0,
+    last_used_at: typeof value['last_used_at'] === 'string' && value['last_used_at'] ? value['last_used_at'] : null,
+  }
+}
+
+/** Validate metadata the editor/agent can write without rejecting legacy entries that lack it. */
+function validateEntryMeta(entryData: Rec): void {
+  if (entryData['tags'] !== undefined) {
+    const tags = entryData['tags']
+    if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === 'string')) throw new Error('资料标签必须是文本列表')
+    const normalized = [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))]
+    if (normalized.length > ENTRY_TAG_LIMIT) throw new Error(`资料标签最多 ${ENTRY_TAG_LIMIT} 个`)
+    if (normalized.some((tag) => tag.length > ENTRY_TAG_MAX_LENGTH)) throw new Error(`单个资料标签最多 ${ENTRY_TAG_MAX_LENGTH} 个字符`)
+    entryData['tags'] = normalized
+  }
+  if (entryData['favorite'] !== undefined && typeof entryData['favorite'] !== 'boolean') throw new Error('收藏状态必须是布尔值')
+  if (entryData['use_count'] !== undefined && (!Number.isSafeInteger(entryData['use_count']) || (entryData['use_count'] as number) < 0))
+    throw new Error('使用次数必须是非负整数')
+  if (entryData['last_used_at'] !== undefined && entryData['last_used_at'] !== null && typeof entryData['last_used_at'] !== 'string')
+    throw new Error('最近使用时间必须是文本或空值')
+}
+
+function clip(value: unknown, limit: number): string {
+  const text = typeof value === 'string' ? value : ''
+  return text.length > limit ? text.slice(0, limit) + '…' : text
+}
+
+function ownSearchText(data: Rec): string {
+  const pieces: string[] = []
+  const add = (value: unknown): void => { if (typeof value === 'string' && value) pieces.push(value) }
+  add(data['prompt'])
+  add(data['negative_prompt'])
+  add(data['notes'])
+  for (const tag of Array.isArray(data['tags']) ? data['tags'] : []) add(tag)
+  for (const set of Array.isArray(data['prompt_sets']) ? data['prompt_sets'] as Rec[] : []) {
+    add(set?.['name'])
+    add(set?.['prompt'])
+    add(set?.['negative_prompt'])
+  }
+  return pieces.join('\n').toLowerCase()
+}
+
 export function applyStoreEntries(store: Store): void {
   const data = () => store.data
+  // Parsed-entry cache: searching and faceting must not re-JSON.parse every row on each keystroke.
+  const cache = new Map<string, CachedEntry>()
 
+  const cached = (row: EntryRow): CachedEntry => {
+    const hit = cache.get(row.id)
+    if (hit && hit.encoded === row.data) return hit
+    let parsed: Rec
+    try { parsed = JSON.parse(row.data) as Rec } catch { parsed = {} }
+    const item: CachedEntry = { encoded: row.data, data: parsed, meta: entryMeta(parsed), ownText: ownSearchText(parsed) }
+    cache.set(row.id, item)
+    return item
+  }
+
+  const enriched = (row: EntryRow, index: Map<string, CachedEntry>, rows: Map<string, EntryRow>): CachedEntry & { text: string; parentName: string | null } => {
+    const item = cached(row)
+    const parts = [row.name, item.ownText]
+    let parentName: string | null = null
+    if (row.kind === 'branch' && row.parent_id) {
+      const parent = index.get(row.parent_id)
+      const parentRow = rows.get(row.parent_id)
+      if (parentRow) {
+        parentName = parentRow.name
+        parts.push(parentRow.name)
+        if (parent) parts.push(parent.ownText)
+      }
+    }
+    if (row.kind === 'blend') {
+      for (const artist of Array.isArray(item.data['artists']) ? item.data['artists'] as Rec[] : []) {
+        const ident = typeof artist?.['id'] === 'string' ? artist['id'] : ''
+        const ref = index.get(ident)
+        const refRow = rows.get(ident)
+        if (refRow) parts.push(refRow.name)
+        if (ref) parts.push(ref.ownText)
+      }
+    }
+    return { ...item, parentName, text: parts.join('\n').toLowerCase() }
+  }
+
+  /** Full rows (agent/export/web compatibility) keep the legacy list shape. */
   store.listEntries = (query = '', kind: string | null = null): Rec[] => {
     if (kind !== null && !ENTRY_KINDS.has(kind)) throw new Error('未知资料类型')
-    const needle = query.toLowerCase()
-    return data().entries
-      .slice().sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id))
-      .filter((row) => (kind === null || row.kind === kind))
-      .filter((row) => {
-        if (!needle) return true
-        const decoded = JSON.stringify(JSON.parse(row.data))
-        let parentName = ''
-        if (row.kind === 'branch' && row.parent_id) {
-          const parent = store._findEntry(row.parent_id)
-          if (parent) parentName = parent.name
-        }
-        return row.name.toLowerCase().includes(needle) ||
-               (parentName && parentName.toLowerCase().includes(needle)) ||
-               decoded.toLowerCase().includes(needle)
-      })
+    const needle = query.trim().toLowerCase()
+    const rows = data().entries.slice().sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id))
+    const index = new Map(rows.map((row) => [row.id, cached(row)]))
+    const byId = new Map(rows.map((row) => [row.id, row]))
+    return rows
+      .filter((row) => kind === null || row.kind === kind)
+      .filter((row) => !needle || enriched(row, index, byId).text.includes(needle))
       .map((row) => store._entryRow(row))
+  }
+
+  /**
+   * Lightweight, paginated library projection for the workbench and Agent tools.
+   * Facets intentionally ignore their own filter so the next click stays possible.
+   */
+  store.queryEntries = (opts: EntryQuery = {}): Rec => {
+    const rawKind = opts.kind == null || opts.kind === '' || opts.kind === 'all' ? null : String(opts.kind)
+    if (rawKind !== null && !ENTRY_KINDS.has(rawKind)) throw new Error('未知资料类型')
+    const query = String(opts.query ?? '').trim()
+    if (query.length > 200) throw new Error('搜索文本最多 200 个字符')
+    const tag = String(opts.tag ?? '').trim()
+    if (tag.length > ENTRY_TAG_MAX_LENGTH) throw new Error(`标签最多 ${ENTRY_TAG_MAX_LENGTH} 个字符`)
+    const favorite = opts.favorite === true
+    const sort = String(opts.sort ?? 'updated')
+    if (!(ENTRY_SORTS as readonly string[]).includes(sort)) throw new Error('未知资料排序方式')
+    const offset = opts.offset ?? 0
+    const limit = opts.limit ?? ENTRY_QUERY_DEFAULT
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a non-negative safe integer')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > ENTRY_QUERY_LIMIT) throw new Error(`limit must be an integer from 1 to ${ENTRY_QUERY_LIMIT}`)
+
+    const rows = data().entries
+    const byId = new Map(rows.map((row) => [row.id, row]))
+    const index = new Map(rows.map((row) => [row.id, cached(row)]))
+    const all = rows.map((row) => ({ row, item: enriched(row, index, byId) }))
+    const terms = query.toLowerCase().split(/\s+/u).filter(Boolean)
+    const queryMatch = all.filter(({ item }) => terms.every((term) => item.text.includes(term)))
+    const tagNeedle = tag.toLowerCase()
+    const matchesTag = (item: CachedEntry): boolean => !tag || item.meta.tags.some((value) => value.toLowerCase() === tagNeedle)
+    const matchesFavorite = (item: CachedEntry): boolean => !favorite || item.meta.favorite
+    const matchesKind = (row: EntryRow): boolean => rawKind === null || row.kind === rawKind
+    const filtered = queryMatch.filter(({ row, item }) => matchesKind(row) && matchesFavorite(item) && matchesTag(item))
+
+    // Each facet ignores only its own filter; query and the other two still apply.
+    const kindsBase = queryMatch.filter(({ item }) => matchesFavorite(item) && matchesTag(item))
+    const favoritesBase = queryMatch.filter(({ row, item }) => matchesKind(row) && matchesTag(item))
+    const tagsBase = queryMatch.filter(({ row, item }) => matchesKind(row) && matchesFavorite(item))
+    const kindCounts: Rec = Object.fromEntries(ENTRY_KIND_ORDER.map((kind) => [kind, 0]))
+    for (const { row } of kindsBase) kindCounts[row.kind] = Number(kindCounts[row.kind] ?? 0) + 1
+    const tagCounts = new Map<string, number>()
+    for (const { item } of tagsBase) for (const value of item.meta.tags) tagCounts.set(value, (tagCounts.get(value) ?? 0) + 1)
+    const tags = [...tagCounts.entries()].map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'zh-CN')).slice(0, 12)
+
+    const rank = (kind: string): number => ENTRY_KIND_ORDER.indexOf(kind as (typeof ENTRY_KIND_ORDER)[number])
+    type Match = (typeof all)[number]
+    const byUpdated = (a: Match, b: Match): number => b.row.updated_at.localeCompare(a.row.updated_at) || a.row.id.localeCompare(b.row.id)
+    const compare = (a: Match, b: Match): number => {
+      switch (sort) {
+        case 'created': return b.row.created_at.localeCompare(a.row.created_at) || byUpdated(a, b)
+        case 'name': return a.row.name.localeCompare(b.row.name, 'zh-CN') || byUpdated(a, b)
+        case 'used': return b.item.meta.use_count - a.item.meta.use_count || byUpdated(a, b)
+        case 'favorite': return Number(b.item.meta.favorite) - Number(a.item.meta.favorite) || byUpdated(a, b)
+        case 'kind': return rank(a.row.kind) - rank(b.row.kind) || a.row.name.localeCompare(b.row.name, 'zh-CN') || byUpdated(a, b)
+        default: return byUpdated(a, b)
+      }
+    }
+    const ordered = filtered.slice().sort(compare)
+    const children = new Map<string, Array<{ id: string; name: string }>>()
+    for (const row of rows) {
+      if (row.kind !== 'branch' || !row.parent_id) continue
+      const list = children.get(row.parent_id) ?? []
+      list.push({ id: row.id, name: row.name })
+      children.set(row.parent_id, list)
+    }
+    const page = ordered.slice(offset, offset + limit).map(({ row, item }) => {
+      const entryData = item.data
+      const promptSets = Array.isArray(entryData['prompt_sets']) ? entryData['prompt_sets'] as Rec[] : []
+      const examples = Array.isArray(entryData['examples']) ? entryData['examples'] as string[] : []
+      const branches = row.kind === 'character' ? children.get(row.id) ?? [] : undefined
+      return {
+        id: row.id, kind: row.kind, parent_id: row.parent_id, parent_name: item.parentName,
+        name: row.name, revision: row.revision, created_at: row.created_at, updated_at: row.updated_at,
+        tags: item.meta.tags, favorite: item.meta.favorite, use_count: item.meta.use_count, last_used_at: item.meta.last_used_at,
+        prompt_preview: clip(entryData['prompt'], 160),
+        negative_preview: clip(entryData['negative_prompt'], 120),
+        prompt_set_count: promptSets.length,
+        prompt_set_names: promptSets.map((set) => String(set?.['name'] ?? '')).filter(Boolean).slice(0, 8),
+        example_count: examples.length,
+        cover_asset_id: examples[0] ?? null,
+        ...(branches ? { branches: branches.slice().sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')) } : {}),
+      }
+    })
+    return {
+      items: page, total: ordered.length, offset, limit,
+      next_offset: offset + page.length < ordered.length ? offset + page.length : null,
+      sort,
+      facets: {
+        all: kindsBase.length,
+        kinds: kindCounts,
+        favorites: favoritesBase.filter(({ item }) => item.meta.favorite).length,
+        tags,
+      },
+    }
   }
 
   store.getEntry = (id: string): Rec => {
@@ -66,6 +273,7 @@ export function applyStoreEntries(store: Store): void {
     }
     const promptSets = entryData['prompt_sets'] ?? []
     if (!Array.isArray(promptSets) || !promptSets.every((v) => v instanceof Object && !Array.isArray(v))) throw new Error('提示词组必须是对象列表')
+    validateEntryMeta(entryData)
     if (item['kind'] === 'blend') {
       const artists = entryData['artists'] ?? []
       if (!Array.isArray(artists)) throw new Error('画师混合需要列表')
@@ -92,6 +300,7 @@ export function applyStoreEntries(store: Store): void {
     if (idx >= 0) data().entries[idx] = row
     else data().entries.push(row)
     store.internalPersist()
+    cache.delete(finalId)
     return store.getEntry(finalId)
   }
 
@@ -110,6 +319,49 @@ export function applyStoreEntries(store: Store): void {
     }
     data().entries = data().entries.filter((e) => e.id !== id)
     store.internalPersist()
+    cache.delete(id)
+  }
+
+  /** Record one or more applied entries in a single document write; content revisions stay unchanged. */
+  store.recordEntriesUse = (ids: string[], at: string | null = null): Rec[] => {
+    const unique = [...new Set(ids)]
+    if (!unique.length) return []
+    const stamp = at ?? nowStamp()
+    const previous = new Map<string, string>()
+    const rows: EntryRow[] = []
+    try {
+      for (const id of unique) {
+        const row = store._findEntry(id)
+        if (!row) throw new KeyError(id)
+        previous.set(id, row.data)
+        const entryData = JSON.parse(row.data) as Rec
+        const count = Number(entryData['use_count'])
+        entryData['use_count'] = (Number.isSafeInteger(count) && count > 0 ? count : 0) + 1
+        entryData['last_used_at'] = stamp
+        row.data = encode(entryData)
+        rows.push(row)
+      }
+      store.internalPersist()
+    } catch (error) {
+      for (const [id, before] of previous) {
+        const row = store._findEntry(id)
+        if (row) row.data = before
+      }
+      throw error
+    }
+    for (const id of unique) cache.delete(id)
+    return rows.map((row) => store._entryRow(row))
+  }
+
+  store.recordEntryUse = (id: string, at: string | null = null): Rec => store.recordEntriesUse([id], at)[0]!
+
+  /** Toggle the favorite flag through the normal save path so validation and revisions stay consistent. */
+  store.setEntryFavorite = (id: string, favorite: boolean, expectedRevision: number | null = null): Rec => {
+    if (typeof favorite !== 'boolean') throw new Error('收藏状态必须是布尔值')
+    const current = store.getEntry(id)
+    if (expectedRevision !== null && expectedRevision !== undefined && current['revision'] !== expectedRevision)
+      throw new ConflictError('资料已被更新，请刷新后重试')
+    return store.saveEntry({ data: { ...(current['data'] as Rec), favorite } }, id, current['revision'] as number)
   }
   store.importEntries = (entries: Rec[], choices: Rec | null = null, expectedRevisions: Rec | null = null): Rec => {
     // Import a portable library atomically, with fresh IDs and rebound links.
@@ -167,6 +419,7 @@ export function applyStoreEntries(store: Store): void {
       }
       const promptSets = entryData['prompt_sets'] ?? []
       if (!Array.isArray(promptSets) || !promptSets.every((v) => v instanceof Object)) throw new Error('提示词组必须是对象列表')
+      validateEntryMeta(entryData)
       if (kind === 'blend') {
         const artists = entryData['artists'] ?? []
         if (!Array.isArray(artists)) throw new Error('画师混合需要列表')
@@ -197,6 +450,7 @@ export function applyStoreEntries(store: Store): void {
       data().entries = previousEntries
       throw error
     }
+    cache.clear()
     return { id_map: Object.fromEntries(mapping), entries_imported: written, entries_skipped: skipped }
   }
 

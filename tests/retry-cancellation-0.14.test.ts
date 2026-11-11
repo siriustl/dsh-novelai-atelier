@@ -94,7 +94,7 @@ describe('bounded safe POST retries', () => {
     const failure = expect(pending).rejects.toMatchObject({ notSubmitted: true, status_code: 429, partialResult: { anlas_spent: 0 } })
     await vi.advanceTimersByTimeAsync(6000); await failure
     expect(fetchMock).toHaveBeenCalledTimes(3)
-    expect(receipts()[0]).toMatchObject({ status: 'prepared', not_submitted: true, anlas_spent: 0 })
+    expect(receipts()[0]).toMatchObject({ status: 'failed', server_rejected: true, not_submitted: true, anlas_spent: 0 })
   })
 
   it('checks stop or cancellation before every retry submission', async () => {

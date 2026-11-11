@@ -101,6 +101,15 @@ describe('authenticated gallery reveal HTTP route', () => {
     expect(vi.mocked(spawn).mock.calls[0]?.[1]).toEqual([dirname(String(api.asset.path))])
     expect(vi.mocked(spawn).mock.calls[0]?.[2]).toMatchObject({ windowsHide: false })
   })
+  it('launches Explorer with /select flag when select is requested', async () => {
+    const api = await server(true)
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    const launcher = child()
+    vi.mocked(spawn).mockImplementation(() => { queueMicrotask(() => launcher.emit('spawn')); return launcher as any })
+    const response = await api.post({ job_id: api.job.id, asset_id: api.asset.id, select: true })
+    expect(response.status).toBe(200)
+    expect(vi.mocked(spawn).mock.calls[0]?.[1]).toEqual([`/select,${api.asset.path}`])
+  })
   it('returns an actionable 503 launcher failure instead of a generic config error', async () => {
     const api = await server(true), launcher = child()
     vi.mocked(spawn).mockImplementation(() => { queueMicrotask(() => launcher.emit('error', new Error('ENOENT'))); return launcher as any })

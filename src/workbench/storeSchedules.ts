@@ -4,6 +4,7 @@ import type { ScheduleRow } from './storeDoc.ts'
 import { ConflictError, KeyError, encode, integer, money, nowStamp, randomId, timestamp, asUtc, nextDaily, validTimezone, localInstant } from './util.ts'
 import { checkScheduledRequest } from './scheduledAssistant.ts'
 import { creativeDraft } from './schedulePlanner.ts'
+import { scheduleOutputSubdir, scheduleRequest } from './scheduleOutput.ts'
 
 function scheduleView(row: ScheduleRow): Rec {
   const value = JSON.parse(row.data) as Rec
@@ -77,7 +78,7 @@ export function applyStoreSchedules(store: Store): void {
     }
     if (previous) item['enabled'] = previous.enabled === 1
     const allowed = ['name', 'enabled', 'kind', 'timezone', 'at', 'time', 'interval_minutes', 'operation', 'request',
-      'count', 'max_total_anlas', 'max_runs', 'missed_policy', 'snapshot', 'seed_mode', 'execution_mode', 'ai_recipe']
+      'count', 'max_total_anlas', 'max_runs', 'missed_policy', 'snapshot', 'seed_mode', 'execution_mode', 'ai_recipe', 'output_subdir']
     for (const key of allowed) if (key in input) item[key] = structuredClone(input[key])
     item['execution_mode'] ??= 'fixed'
     if (typeof item['execution_mode'] !== 'string' || !['fixed', 'ai'].includes(item['execution_mode'])) throw new Error('执行模式必须是 fixed 或 ai')
@@ -102,6 +103,12 @@ export function applyStoreSchedules(store: Store): void {
     if (typeof item['operation'] !== 'string' || !(item['request'] instanceof Object)) throw new Error('计划需要 operation 和 request')
     if (!['fixed', 'increment', 'random'].includes((item['seed_mode'] ?? 'fixed') as string)) throw new Error('未知种子模式')
     if ('snapshot' in item && !(item['snapshot'] instanceof Object)) throw new Error('计划 snapshot 必须是对象')
+    const suppliedRequest = input['request'] as Rec | undefined
+    if (!('output_subdir' in input) && suppliedRequest && 'output_subdir' in suppliedRequest)
+      item['output_subdir'] = suppliedRequest['output_subdir']
+    item['output_subdir'] = scheduleOutputSubdir(item)
+    item['request'] = scheduleRequest(item)
+    if (item['snapshot']) (item['snapshot'] as Rec)['request'] = structuredClone(item['request'])
     let candidate: Date
     if (item['kind'] === 'once') {
       try {
@@ -306,7 +313,7 @@ export function applyStoreSchedules(store: Store): void {
             for (let index = 0; index < (item['count'] as number); index++) {
               const snapshot = structuredClone((item['snapshot'] ?? {}) as Rec)
               snapshot['operation'] = item['operation']
-              snapshot['request'] = structuredClone(item['request'])
+              snapshot['request'] = scheduleRequest(item)
               snapshot['schedule_run'] = { schedule_id: row.id, scheduled_for: row.next_run, revision: row.revision }
               store.scheduleSeed(snapshot['request'] as Rec, item, runs, index)
               snapshots.push(snapshot)
@@ -467,7 +474,7 @@ export function applyStoreSchedules(store: Store): void {
       for (let i = 0; i < (schedule['count'] as number); i++) {
         const snapshot = structuredClone((schedule['snapshot'] ?? {}) as Rec)
         snapshot['operation'] = schedule['operation']
-        snapshot['request'] = structuredClone(schedule['request'])
+        snapshot['request'] = scheduleRequest(schedule)
         snapshot['schedule_run'] = { schedule_id: ident, scheduled_for: stamp, revision }
         store.scheduleSeed(snapshot['request'] as Rec, schedule, schedule['runs'] as number, i)
         snapshots.push(snapshot)
