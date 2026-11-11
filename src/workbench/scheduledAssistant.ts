@@ -1,5 +1,6 @@
 /** Pure final checks for AI-created scheduled requests. Ported from scheduled_assistant.py. */
 import { createHash } from 'node:crypto'
+import { checkScheduleOutput, scheduleRequest } from './scheduleOutput.ts'
 
 const MISSING = Symbol('missing')
 
@@ -36,8 +37,8 @@ function protectedCheck(before: unknown, after: unknown, path = 'request'): void
 /** Reject a changed lock, removed fixed text or escalated spending ceiling. */
 export function checkScheduledRequest(schedule: Record<string, unknown>, request: unknown): Record<string, unknown> {
   if (!(request instanceof Object) || Array.isArray(request)) throw new Error('AI 计划需要完整 request 对象')
-  const req = request as Record<string, unknown>
-  const base = schedule['request'] as Record<string, unknown>
+  const req = checkScheduleOutput(schedule, request as Record<string, unknown>)
+  const base = scheduleRequest(schedule)
   const before = { operation: schedule['operation'], request: base }
   const after = { operation: schedule['operation'], request: req }
   const recipe = (schedule['ai_recipe'] ?? {}) as Record<string, unknown>

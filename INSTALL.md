@@ -1,42 +1,73 @@
-# DSH NovelAI Atelier 0.15.3 安装
+# 安装与升级
 
-## 推荐：桌面 GUI
+适用于当前发布版本。tgz 包不含令牌、资料或图片，也不需要 Python、Node 或 pnpm——DSH 自带运行环境。
 
-1. 将 `dsh-novelai-atelier-0.15.3.tgz` 放到本机任意稳定目录。不要解压，不需要下载源码或运行构建命令。
-2. 打开 DeepSeek Harness 左侧的「插件」页面，点击「添加插件」。
-3. 在「包名或地址」填写文件的绝对路径，例如 `D:\Downloads\dsh-novelai-atelier-0.15.3.tgz`，然后执行安装。该界面使用路径输入，不提供文件上传控件；相对路径不支持。
-4. 安装完成后点击「立即启用」。GUI 的添加操作默认只安装，不自动启用。
-5. 首次安装通常可热应用。为确认 Host、原生依赖及网页构建版本一致，建议完整退出 DSH 再打开。升级已有同名插件、界面提示「下次启动生效」或入口未出现时，必须完整重启；刷新浏览器页面不可靠。
-6. 在会话右侧栏打开「NovelAI 生图工作台」，设置自己的 NovelAI `pst-…` 令牌。AI 构思默认跟随 DSH 已配置模型，不需要另配语言模型 Key。
-7. 让 Agent 按需启用 NAI 工具并调用 `nai_workbench_status({info:true})`，确认 `runtime_version` 为 `0.15.3`。新建默认计划应先保持停用，确认请求、张数和执行次数后再启用。
+## 首次安装
 
-首次安装需要联网下载依赖。安装文件不包含 NovelAI 订阅、额度、令牌、个人资料库或图片。不需要 Python，也不需要全局安装 Node / pnpm 开发工具；DSH 使用自己的运行环境。
+### 桌面 GUI
 
-## 桌面自带 CLI
+1. 把下载的 `dsh-novelai-atelier-<version>.tgz` 放到本机一个稳定目录。**不要解压。**
+2. 打开 DSH 左侧「插件」页 → 「添加插件」。
+3. 「包名或地址」填该 `.tgz` 文件的绝对路径。该输入框只接受路径，不支持相对路径或上传。
+4. 安装完成后点「立即启用」——添加和启用是两步。
+5. 完整退出并重新打开 DSH。首次安装常常能热应用，但 Host、原生依赖和前端模块要一起生效，刷新页面不算数。
 
-普通独立安装的 DSH CLI 不管理保留的 `desktop` profile，应使用桌面程序自带的启动脚本。以默认 Windows 安装位置为例，在 PowerShell 执行：
+### 命令行
+
+DSH 桌面版保留的 `desktop` profile 只由桌面程序管理，独立安装的 CLI 管不到。用桌面自带的启动脚本：
+
+将 `$dsh` 设为本机 DSH 安装目录下的 `resources/runtime/cli/bin/dsh.cmd`，再执行：
 
 ```powershell
-& 'D:\Program Files\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add 'D:\Downloads\dsh-novelai-atelier-0.15.3.tgz'
+& $dsh plugin --profile desktop add '<absolute-path-to-tgz>'
 ```
 
-安装位置不同，替换启动脚本路径；插件路径必须替换成实际的压缩包绝对路径。
+`--profile desktop` 必须写在 `add` 前面，否则参数会被直接转交给包管理器。CLI 首次添加新 bundle 会自动登记启用；已被手动停用的 bundle 再次 `add` 不会自动恢复启用。
 
-**`--profile desktop` 必须放在 `add` 前面。** `plugin add --profile desktop ...` 会把后面的参数转交包管理器，不能正确选择 profile。
+## 装好之后
 
-CLI 首次添加新的 bundle 依赖会自动登记启用；已有但被关闭的 bundle 再次 `add` 不会自动恢复启用，请在 GUI「插件」页启用。安装覆盖现有同名依赖后完整退出并重新打开 DSH。
+1. 在会话右侧栏打开「NovelAI 生图工作台」，在设置里添加接口：官方填 `https://image.novelai.net` 加自己的 `pst-…` 令牌；中转接口填它给的地址（通常以 `/v1` 结尾）和 key。可保存多条；非官方接口可勾选「小图免费（类 Opus）」、填拼车人数（V5 额度按 1/N 估算）和自填订阅备注；想让工作台读到 V5 百分比时，在「站点额度查询」选画喵预设并粘贴站点登录令牌。
+2. 让 Agent 调 `nai_workbench_status({info:true})`，确认 `runtime_version` 为 `0.19.4` 且工具为 16 项。
+3. AI 构思默认跟随 DSH 已配置的模型，不需要另配语言模型 Key。
+4. 新建的计划默认停用，先核对请求、张数和执行次数再启用。
 
-## 兼容与迁移
+## 升级
 
-- 验证宿主：DSH `0.2.0-rc.2`、Cordis `4.0.4`，Node `^22.19.0 || >=24.0.0`。Sharp `0.35.5` 与验证宿主的 libvips `8.18.7` 对齐。
-- 遇到 peer dependency 不兼容时不要强行开版本豁免；先核对 DSH 与插件版本。其他宿主版本尚未宣称全部兼容。
-- 已有工作台数据默认仍在 `~/.novelai-workbench`，输出仍在用户配置目录。升级不导入开发者的测试数据，不删除用户数据，也不改变默认 Agent 模式。
-- 插件默认工具有 15 项。普通模式只有 `nai_use_tools` 入口，调用 `nai_use_tools({enabled:true})` 在当前会话加载完整工具；也可以新建「NovelAI Atelier」模式会话。
-- 内置指南使用统一的 `prompting` 通用核心，模型和构图详情按需读取。
-- 旧 AI 计划若已经将资料词写进手工基准提示词，升级不会猜测并删除这些文字。取消绑定时也应核对基准草稿与固定片段。新计划把资料身份保持在冻结配方中，不再污染基准请求。
+覆盖安装同名插件后完整退出并重开 DSH；界面若提示「下次启动生效」，同样需要重启。
 
-## 卸载与隐私
+从旧包名 `nai-atelier` 迁移时：
 
-停用插件前先停用计划、暂停队列，并等待已提交请求结清。取消或关闭 DSH 不代表 NovelAI 服务端没有执行或扣费。移除插件依赖不会自动删除个人数据和图片；备份或清理应由用户明确决定。
+1. 停用计划、等待队列结清，备份 profile 的 `package.json`、`pnpm-lock.yaml`、`cordis.patch.yml`。
+2. 在「插件」页移除旧 bundle（或 `dsh plugin --profile desktop remove nai-atelier`）。
+3. 若 profile 的 `cordis.patch.yml` 里有用 `file:///…/lib/host-live.js`、`lib/agent-live.js` 直接挂载工作区代码的条目，一并停用——它们不受包管理，会和 tgz 里的 Host 重复挂载。
+4. 安装新 tgz 并启用，完整重启 DSH，再按上一节确认版本与工具数。
 
-分发与安装时只需提供标准的 `.tgz` 发布包。请勿将本机的私有工作台目录（`~/.novelai-workbench`）、凭据目录（`secrets/`）或全库备份对外传播。此外，从画廊或资料库导出的作品原图可能保留了生成提示词、EXIF 信息、PNG 文本块和隐藏 Alpha 元数据，对外公开前请自行核对。
+不要同时保留两个 bundle，也不要为此删除 `node_modules`、手改 Junction 或清理 `~/.novelai-workbench`。
+
+## 开发安装
+
+改代码时不必反复打包，直接把 profile 指向工作区：
+
+```powershell
+& $dsh plugin --profile desktop add 'link:<absolute-path-to-workspace>'
+```
+
+改完先 `pnpm run build`，Host 侧改动需要完整重启 DSH，客户端改动刷新页面即可。发布前用 `pnpm pack` 出 tgz，再按上面的流程验证一遍实际发布物。
+
+## 兼容性
+
+- 验证宿主：DSH `0.2.1-rc.2`、Cordis `4.0.5`、Schemastery `3.18.5`，Node `^22.19.0 || >=24.0.0`。
+- peer 依赖允许同一兼容系列的 Cordis `^4.0.4`、Schemastery `^3.18.4`。遇到 peer 冲突先核对版本，不要强开版本豁免。
+- 其他 DSH 版本尚未声明兼容。
+
+## 数据与卸载
+
+- 工作台数据：`~/.novelai-workbench`；图片输出目录在设置里配置，默认 `~/Pictures/NovelAI`。
+- 卸载或移除插件不会删除这些数据，也不会删除令牌。需要清理请自行决定。
+- 对外分享时只给 `.tgz`，不要带上私有工作台目录、`secrets/` 或整库备份。从画廊导出的原图可能保留提示词、EXIF、PNG 文本块和 Alpha 元数据。
+
+## 常见问题
+
+- **入口没出现**：确认 bundle 已在插件页启用，然后完整重启 DSH。
+- **装的是旧版本**：`nai_workbench_status({info:true})` 的 `runtime_version` 是最终依据，界面缓存不可靠。
+- **停用插件就算停了计费？** 不是。请求已提交到 NovelAI 就仍会执行和扣费，停用前先等队列结清。

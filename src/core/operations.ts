@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { z } from 'zod'
 import { expandPath } from './imageInputs.ts'
 import { prepareMask, readImage, type ImageInput, type MaskSettings } from './imageInputs.ts'
-import { compileRequest, GenerationRequestSchema, splitPromptText, validateRequest, isV5, type GenerationRequest, type CharacterInput } from './models.ts'
+import { compileRequest, GenerationRequestSchema, splitPromptText, validateRequest, isV5, isV5Medium, type GenerationRequest, type CharacterInput } from './models.ts'
 import { decodePng, encodePng } from './png.ts'
 import { Raster, imageBase64, sha256Hex } from './raster.ts'
 
@@ -21,6 +21,7 @@ export interface PreparedOperation {
   generation_request: GenerationRequest | null
   output_kind: string
   max_anlas: number
+  output_subdir?: string | null
   inpaint_context: {
     source: Raster
     mask: Raster
@@ -32,6 +33,7 @@ function prepared(partial: Partial<PreparedOperation> & Pick<PreparedOperation, 
   return {
     expected_outputs: 1, expected_dimensions: null, summary: {}, warnings: [],
     generation_request: null, output_kind: 'image', max_anlas: 0, inpaint_context: null,
+    output_subdir: partial.output_subdir ?? partial.generation_request?.output_subdir ?? (partial.summary?.['request'] as { output_subdir?: string | null } | undefined)?.output_subdir ?? null,
     ...partial,
   }
 }
@@ -71,7 +73,22 @@ export const InpaintRequestSchema = Base.omit({ model: true }).extend({
 })
 export type InpaintRequest = z.infer<typeof InpaintRequestSchema>
 
+export const OutpaintRequestSchema = Base.omit({ model: true }).extend({
+  model: z.enum(['nai-diffusion-5-full', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']).default('nai-diffusion-5-full'),
+  image_path: z.string().min(1),
+  left: z.number().int().min(0).default(0),
+  right: z.number().int().min(0).default(0),
+  top: z.number().int().min(0).default(0),
+  bottom: z.number().int().min(0).default(0),
+  seam_overlap: z.number().int().min(0).max(128).default(32),
+  strength: z.number().min(0).max(1).default(1),
+  extra_noise_seed: z.number().int().min(0).max(4294967295).nullable().optional(),
+  color_correct: z.boolean().default(true),
+})
+export type OutpaintRequest = z.infer<typeof OutpaintRequestSchema>
+
 export const UpscaleRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
   image_path: z.string().min(1),
   model: z.literal('nai-diffusion-5-curated').default('nai-diffusion-5-curated'),
   max_anlas: z.number().int().min(0).default(0),
@@ -83,6 +100,7 @@ export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'scared', 'surprise
   'irritated', 'aroused', 'embarrassed', 'worried', 'love', 'determined', 'hurt', 'playful'] as const
 
 export const AugmentRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
   image_path: z.string().min(1),
   tool: z.enum(['bg-removal', 'lineart', 'sketch', 'colorize', 'emotion', 'declutter', 'declutter-keep-bubbles']),
   prompt: z.string().max(10000).default(''),
@@ -95,6 +113,7 @@ export type AugmentRequest = z.infer<typeof AugmentRequestSchema>
 export const V45_MODELS = ['nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated'] as const
 
 export const EncodeVibeRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
   image_path: z.string().min(1),
   model: z.enum(V45_MODELS).default('nai-diffusion-4-5-full'),
   information_extracted: z.number().min(0.01).max(1).default(0.7),
@@ -201,7 +220,7 @@ export interface InpaintPostContext {
  * The raw API result should also be retained by the caller: compositing changes
  * the alpha-channel bits that may carry NovelAI's hidden metadata. */
 export function postprocessInpaint(sourcePng: Uint8Array, maskPng: Uint8Array, generatedPng: Uint8Array, prepared: PreparedOperation): Buffer {
-  if (prepared.operation !== 'inpaint') throw new Error('Inpaint postprocessing requires a prepared inpaint operation')
+  if (prepared.operation !== 'inpaint' && prepared.operation !== 'outpaint') throw new Error('Inpaint postprocessing requires a prepared inpaint or outpaint operation')
   const source = Raster.fromDecoded(decodePng(sourcePng))
   const mask = Raster.fromDecoded(decodePng(maskPng))
   const generatedRaw = decodePng(generatedPng)
@@ -277,10 +296,14 @@ function fullRequest(r: Omit<GenerationRequest, 'width' | 'height'> & { width: n
 
 export function prepareGeneration(request: GenerationRequest): PreparedOperation {
   const { payload, warnings } = compileRequest(request)
+  // Medium rewrites several fields before submission; the preview must not show the unused ones.
+  const effective = isV5Medium(request)
+    ? { ...request, steps: 14, sampler: 'k_euler_ancestral', cfg_rescale: 0, negative_preset: 'heavy', negative_prompt: '' }
+    : request
   return prepared({
     operation: 'generate', endpoint: '/ai/generate-image', payload,
     expected_dimensions: [{ width: request.width, height: request.height }],
-    summary: { request }, warnings, generation_request: request, max_anlas: request.max_anlas,
+    summary: { request: effective }, warnings, generation_request: request, max_anlas: request.max_anlas,
   })
 }
 
@@ -291,7 +314,30 @@ function dims(raw: Record<string, unknown>): { explicit: boolean; width?: number
 }
 
 /** Prepare a request locally; performs no network calls and writes nothing. */
+/** Kinds whose arguments come straight from the model; used to flag silently dropped keys. */
+const KIND_SCHEMAS: Record<string, { shape: Record<string, unknown> }> = {
+  generate: GenerationRequestSchema,
+  img2img: Img2ImgRequestSchema,
+  enhance: EnhanceRequestSchema,
+  inpaint: InpaintRequestSchema,
+  outpaint: OutpaintRequestSchema,
+  upscale: UpscaleRequestSchema,
+  augment: AugmentRequestSchema,
+  encode_vibe: EncodeVibeRequestSchema,
+  reference_generate: ReferenceGenerationRequestSchema,
+}
+
 export async function prepareOperation(rawRequest: unknown, kind: string): Promise<PreparedOperation> {
+  const preparedOp = await prepareOperationInner(rawRequest, kind)
+  const schema = KIND_SCHEMAS[kind]
+  if (schema && rawRequest instanceof Object && !Array.isArray(rawRequest)) {
+    const ignored = Object.keys(rawRequest as Record<string, unknown>).filter((key) => key !== 'request' && !(key in schema.shape))
+    if (ignored.length) preparedOp.warnings.push(`忽略未知参数：${ignored.join('、')}`)
+  }
+  return preparedOp
+}
+
+async function prepareOperationInner(rawRequest: unknown, kind: string): Promise<PreparedOperation> {
   if (kind === 'upscale') {
     const request = UpscaleRequestSchema.parse(rawRequest)
     const source = await readImage(request.image_path)
@@ -365,6 +411,11 @@ export async function prepareOperation(rawRequest: unknown, kind: string): Promi
       throw new Error('focus_box needs right > left and bottom > top')
     return prepareInpaint(request, raw)
   }
+  if (kind === 'outpaint') {
+    const raw = rawRequest as Record<string, unknown>
+    const request = OutpaintRequestSchema.parse(raw)
+    return prepareOutpaint(request, raw)
+  }
   throw new Error(`Unsupported operation kind: ${kind}`)
 }
 
@@ -436,7 +487,7 @@ export async function prepareReferencesAsync(request: ReferenceGenerationRequest
     params['director_reference_images'] = images
     params['director_reference_descriptions'] = request.precise_references.map((ref) => ({ caption: { base_caption: ref.type, char_captions: [] }, legacy_uc: false }))
     params['director_reference_strength_values'] = request.precise_references.map((r) => r.strength)
-    params['director_reference_secondary_strength_values'] = request.precise_references.map((r) => 1 - r.fidelity)
+    params['director_reference_secondary_strength_values'] = request.precise_references.map((r) => Math.max(0, Math.min(1, 1 - r.fidelity)))
     params['director_reference_information_extracted'] = request.precise_references.map(() => 1)
     preparedOp.summary['references'] = summaries
   }
@@ -612,6 +663,108 @@ async function prepareInpaint(request: InpaintRequest, raw: Record<string, unkno
     finalParams['img2img'] = { strength: request.strength, color_correct: request.color_correct }
   preparedOp.summary['mask'] = maskSource.summary
   preparedOp.operation = 'inpaint'
+  return preparedOp
+}
+
+async function prepareOutpaint(request: OutpaintRequest, raw: Record<string, unknown>): Promise<PreparedOperation> {
+  const source = await readImage(request.image_path)
+  if (raw['model'] === 'nai-diffusion-5-curated')
+    throw new Error('V5 Curated inpainting is not deployed: choose nai-diffusion-5-full or nai-diffusion-4-5-curated explicitly; no model is silently substituted.')
+
+  let left = request.left, right = request.right, top = request.top, bottom = request.bottom
+  if (left === 0 && right === 0 && top === 0 && bottom === 0)
+    throw new Error('At least one of left, right, top, bottom must be greater than 0 for outpainting')
+
+  const rawW = source.image.width + left + right
+  const targetW = Math.ceil(rawW / 64) * 64
+  const diffW = targetW - rawW
+  if (diffW > 0) {
+    if (right > 0) right += diffW
+    else left += diffW
+  }
+
+  const rawH = source.image.height + top + bottom
+  const targetH = Math.ceil(rawH / 64) * 64
+  const diffH = targetH - rawH
+  if (diffH > 0) {
+    if (bottom > 0) bottom += diffH
+    else top += diffH
+  }
+
+  const { explicit, width, height } = dims(raw)
+  if (explicit && (width !== targetW || height !== targetH))
+    throw new Error('Outpainting dimensions are derived from the source and expansion; omit width/height or provide the exact aligned target size')
+
+  if (targetW * targetH > 4194304) {
+    throw new Error(`Outpainted target canvas (${targetW}×${targetH}) exceeds the 4-megapixel limit`)
+  }
+
+  const workingImage = Raster.blank(targetW, targetH, [255, 255, 255, 255])
+  workingImage.blit(source.image, left, top)
+
+  const overlap = request.seam_overlap
+  const insetLeft = left > 0 ? Math.min(overlap, source.image.width) : 0
+  const insetRight = right > 0 ? Math.min(overlap, source.image.width - insetLeft) : 0
+  const insetTop = top > 0 ? Math.min(overlap, source.image.height) : 0
+  const insetBottom = bottom > 0 ? Math.min(overlap, source.image.height - insetTop) : 0
+
+  const presLeft = left + insetLeft
+  const presTop = top + insetTop
+  const presWidth = source.image.width - insetLeft - insetRight
+  const presHeight = source.image.height - insetTop - insetBottom
+
+  const originalMask = Raster.blank(targetW, targetH, [255, 255, 255, 255])
+  if (presWidth > 0 && presHeight > 0) {
+    originalMask.fillRect(presLeft, presTop, presWidth, presHeight, [0, 0, 0, 255])
+  }
+
+  const characters: CharacterInput[] = []
+  for (const c of request.characters) {
+    let charInput = { ...c }
+    if (charInput.x != null && charInput.y != null) {
+      const origPxX = charInput.x * source.image.width
+      const origPxY = charInput.y * source.image.height
+      const newX = Math.max(0, Math.min(1, (origPxX + left) / targetW))
+      const newY = Math.max(0, Math.min(1, (origPxY + top) / targetH))
+      charInput = { ...charInput, x: newX, y: newY }
+    }
+    characters.push(charInput)
+  }
+
+  const resolved = fullRequest({ ...request, width: targetW, height: targetH, characters })
+  const preparedOp = prepareGeneration(resolved)
+  const seed = (preparedOp.payload['parameters'] as Record<string, unknown>)['seed'] as number
+  const effectiveRequest: Record<string, unknown> = { ...request, seed, left, right, top, bottom }
+  delete effectiveRequest['width']
+  delete effectiveRequest['height']
+
+  preparedOp.summary = {
+    request: effectiveRequest, user_request: stripDefaults(raw), source: source.summary,
+    resolved_width: targetW, resolved_height: targetH,
+    outpaint: {
+      left, right, top, bottom, seam_overlap: overlap,
+      source_width: source.image.width, source_height: source.image.height,
+      target_width: targetW, target_height: targetH,
+    },
+  }
+
+  const aligned = prepareMask({ image: originalMask, summary: { has_alpha: false } }, { width: targetW, height: targetH }, 'luminance')
+  const workingMask = aligned.mask
+  preparedOp.summary['mask_settings'] = aligned.settings
+
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  params['extra_noise_seed'] = request.extra_noise_seed ?? (seed - 1 + 4294967296) % 4294967296
+  params['add_original_image'] = false
+  preparedOp.payload['model'] = String(preparedOp.payload['model']) + '-inpainting'
+  preparedOp.payload['action'] = 'infill'
+  params['image'] = imageBase64(workingImage)
+  params['mask'] = imageBase64(workingMask)
+  params['inpaintImg2ImgStrength'] = request.strength
+  if (request.strength < 1)
+    params['img2img'] = { strength: request.strength, color_correct: request.color_correct }
+
+  preparedOp.inpaint_context = { source: workingImage, mask: originalMask }
+  preparedOp.operation = 'outpaint'
   return preparedOp
 }
 

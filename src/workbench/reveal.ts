@@ -10,13 +10,17 @@ export class FolderOpenError extends Error {
   constructor(message: string) { super(message); this.name = 'FolderOpenError' }
 }
 
-export async function openFolder(path: string): Promise<void> {
-  const command = process.platform === 'win32' ? join(process.env['SystemRoot'] || 'C:\\Windows', 'explorer.exe')
+export async function openFolder(path: string, options: { select?: boolean } = {}): Promise<void> {
+  const isWin = process.platform === 'win32'
+  const command = isWin ? join(process.env['SystemRoot'] || 'C:\\Windows', 'explorer.exe')
     : process.platform === 'darwin' ? 'open' : 'xdg-open'
+  const args = options.select
+    ? (isWin ? [`/select,${path}`] : process.platform === 'darwin' ? ['-R', path] : [path])
+    : [path]
   await new Promise<void>((resolve, reject) => {
     // Explorer honors STARTF_USESHOWWINDOW: hiding this GUI process creates an
     // invisible folder window even though spawn succeeds. Never hide it.
-    const child = spawn(command, [path], { shell: false, stdio: 'ignore', windowsHide: false })
+    const child = spawn(command, args, { shell: false, stdio: 'ignore', windowsHide: false })
     const timer = setTimeout(() => {
       child.unref()
       reject(new FolderOpenError('文件管理器启动超时，请重试'))
@@ -39,7 +43,13 @@ export async function openFolder(path: string): Promise<void> {
   })
 }
 
-export async function revealArtwork(wb: Workbench, jobId: unknown, assetId?: unknown, reveal = openFolder): Promise<Rec> {
+export async function revealArtwork(
+  wb: Workbench,
+  jobId: unknown,
+  assetId?: unknown,
+  reveal = openFolder,
+  options: { select?: boolean } = {},
+): Promise<Rec> {
   if (typeof jobId !== 'string' || !jobId) throw new TypeError('请选择作品记录')
   if (assetId !== undefined && (typeof assetId !== 'string' || !assetId)) throw new TypeError('素材 ID 无效')
   const job = wb.store.getJob(jobId)
@@ -74,7 +84,11 @@ export async function revealArtwork(wb: Workbench, jobId: unknown, assetId?: unk
     try { canonical = await realpath(candidate); if (!(await stat(canonical)).isFile()) continue }
     catch (error) { if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) continue; throw error }
     const folder = dirname(canonical)
-    await reveal(folder)
+    if (options.select) {
+      await reveal(canonical, { select: true })
+    } else {
+      await reveal(folder)
+    }
     return { opened: true, directory: folder, path: canonical }
   }
   throw new Error('作品文件不存在，可能已被移动或删除')

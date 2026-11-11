@@ -166,10 +166,12 @@ export function Empty(props: { text: string }): Rec {
   return h('div', { className: 'nai-empty' }, props.text)
 }
 
-export function Select(props: { value: string; onChange: (v: string) => void; options: Array<{ value: string; label: string }>; style?: Rec; disabled?: boolean }): Rec {
+export function Select(props: { value: string; onChange: (v: string) => void; options: Array<{ value: string; label: string }>; style?: Rec; disabled?: boolean; onFocus?: () => void; ariaLabel?: string }): Rec {
   return h('select', {
     value: props.value,
     style: props.style,
+    'aria-label': props.ariaLabel,
+    onFocus: props.onFocus,
     onChange: (e: Rec) => props.onChange((e.target as HTMLSelectElement).value),
     disabled: props.disabled,
   }, props.options.map((o) => h('option', { key: o.value, value: o.value }, o.label)))
@@ -184,10 +186,10 @@ export function Toggle(props: { checked: boolean; onChange: (v: boolean) => void
     props.label)
 }
 
-export function Num(props: { value: number | null; onChange: (v: number | null) => void; min?: number; max?: number; step?: number; style?: Rec; placeholder?: string }): Rec {
+export function Num(props: { value: number | null; onChange: (v: number | null) => void; min?: number; max?: number; step?: number; style?: Rec; placeholder?: string; disabled?: boolean }): Rec {
   return h('input', {
     type: 'number', value: props.value ?? '', min: props.min, max: props.max, step: props.step,
-    placeholder: props.placeholder, style: props.style,
+    placeholder: props.placeholder, style: props.style, disabled: props.disabled,
     onChange: (e: Rec) => {
       const raw = (e.target as HTMLInputElement).value
       props.onChange(raw === '' ? null : Number(raw))

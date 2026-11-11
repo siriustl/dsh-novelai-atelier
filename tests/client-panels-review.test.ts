@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { api, uploadFile, type Rec } from '../client/api.ts'
+import { api, uploadFile, downloadPost, type Rec } from '../client/api.ts'
 import { LibraryPanel } from '../client/panels/library.tsx'
 import { SchedulesPanel } from '../client/panels/schedules.tsx'
 import { GalleryPanel } from '../client/panels/gallery.tsx'
@@ -7,13 +7,14 @@ import { WorkspacePanel } from '../client/panels/workspace.tsx'
 import { MaskEditor } from '../client/panels/mask.tsx'
 import { setReact, type ReactLike } from '../client/ui.tsx'
 
-vi.mock('../client/api.ts', async (original) => ({ ...await original<object>(), api: vi.fn(), uploadFile: vi.fn() }))
+vi.mock('../client/api.ts', async (original) => ({ ...await original<object>(), api: vi.fn(), uploadFile: vi.fn(), downloadPost: vi.fn() }))
 
 function harness() {
   let cursor = 0
   const slots: any[] = [], effects: Array<() => void | (() => void)> = [], cleanups: Array<() => void> = []
   const runtime = {
     createElement: (type: any, props: Rec | null, ...children: unknown[]) => ({ $$typeof: Symbol.for('react.element'), type, props: { ...props, children } }),
+    cloneElement: (element: Rec, props: Rec) => ({ ...element, props: { ...element.props, ...props } }),
     useState(initial: any) {
       const index = cursor++
       if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
@@ -42,12 +43,39 @@ const deferred = <T,>() => { let resolve!: (value: T) => void, reject!: (value: 
 const entry = (id = 'entry'): Rec => ({ id, revision: 1, name: id, kind: 'character', data: { prompt: '', examples: [] } })
 const plan = (id = 'plan'): Rec => ({ id, revision: 1, name: id, execution_mode: 'fixed', kind: 'daily', request: { prompt: 'scene' }, ai_recipe: { library_refs: [] } })
 const state = { draft: { id: 'main', revision: 1, request: {} }, paused: false }
+const entryRow = (item: Rec): Rec => ({
+  ...item,
+  prompt_preview: String((item['data'] as Rec | undefined)?.['prompt'] ?? ''),
+  tags: (item['data'] as Rec | undefined)?.['tags'] ?? [],
+  favorite: (item['data'] as Rec | undefined)?.['favorite'] === true,
+  use_count: 0, last_used_at: null,
+  prompt_set_count: ((item['data'] as Rec | undefined)?.['prompt_sets'] as unknown[] | undefined)?.length ?? 0,
+  example_count: ((item['data'] as Rec | undefined)?.['examples'] as unknown[] | undefined)?.length ?? 0,
+  cover_asset_id: ((item['data'] as Rec | undefined)?.['examples'] as string[] | undefined)?.[0] ?? null,
+  branches: [],
+})
+const libraryPage = (entries: Rec[]): Rec => ({
+  items: entries.map(entryRow), total: entries.length, next_offset: null,
+  facets: {
+    all: entries.length,
+    kinds: Object.fromEntries(['character', 'branch', 'artist', 'blend', 'preset'].map((kind) => [kind, entries.filter((item) => item['kind'] === kind).length])),
+    favorites: entries.filter((item) => (item['data'] as Rec | undefined)?.['favorite'] === true).length,
+    tags: [],
+  },
+})
+function mockLibrary(entries: Rec[]): void {
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (String(path).startsWith('/library/query')) return libraryPage(entries) as any
+    if (path === '/library') return entries as any
+    return {} as any
+  })
+}
 
-beforeEach(() => { vi.useFakeTimers(); vi.mocked(api).mockReset(); vi.mocked(uploadFile).mockReset() })
+beforeEach(() => { vi.useFakeTimers(); vi.mocked(api).mockReset(); vi.mocked(uploadFile).mockReset(); vi.mocked(downloadPost).mockReset() })
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
-async function libraryEditor(newEntry = false) {
-  vi.mocked(api).mockResolvedValue([entry()] as any)
+async function libraryEditor(newEntry = false, entries = [entry()]) {
+  mockLibrary(entries)
   const panel = harness()
   panel.render(LibraryPanel, { state }); panel.effects(); await settle()
   const tree = panel.render(LibraryPanel, { state })
@@ -162,6 +190,151 @@ describe('library editor async ownership', () => {
     expect(text(render())).toContain('two')
     expect(text(render())).not.toContain('one')
     panel.cleanup()
+  })
+})
+
+describe('gallery tag filters', () => {
+  it('offers character and artist entries in separate boxes and filters by their tag text', async () => {
+    const character = { id: 'mira', revision: 1, kind: 'character', name: 'Mira', data: { prompt: 'shinonome akito, silver hair' } }
+    const artist = { id: 'wlop', revision: 1, kind: 'artist', name: 'WLOP', data: { prompt: 'wlop' } }
+    const branch = { id: 'winter', revision: 1, kind: 'branch', name: '冬装', parent_name: 'Mira', data: { prompt: 'winter coat' } }
+    const job = { id: 'job-1', operation: 'generate', status: 'completed', created_at: new Date().toISOString(), request: { prompt: 'portrait, wlop', width: 832, height: 1216 }, assets: [{ id: 'asset-1', path: '/image.png', mime: 'image/png' }] }
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (String(path).startsWith('/gallery?')) return { items: [job], total: 1 } as any
+      if (path === '/library') return [character, artist, branch] as any
+      if (path === '/schedules') return [] as any
+      return {} as any
+    })
+    const panel = harness()
+    panel.render(GalleryPanel, { state }); panel.effects(); await settle()
+    let tree = panel.render(GalleryPanel, { state })
+    expect(text(tree)).not.toContain('内容匹配')
+    expect(text(tree)).not.toContain('资料匹配')
+    const select = (label: string) => nodes(panel.render(GalleryPanel, { state })).find((node) => node.type === 'select' && node.props?.['aria-label'] === label)!
+    select('角色').props.onFocus(); select('画师').props.onFocus(); await settle()
+    panel.render(GalleryPanel, { state }); panel.effects(); await settle()
+    const options = (node: Rec) => (node.props.children as unknown[]).flatMap((child) => Array.isArray(child) ? child : [child]) as Rec[]
+    expect(options(select('角色')).map(text)).toEqual(['全部角色', 'Mira'])
+    expect(options(select('画师')).map(text)).toEqual(['全部画师', 'WLOP'])
+
+    select('角色').props.onChange({ target: { value: 'mira' } }); panel.render(GalleryPanel, { state }); panel.effects(); await settle()
+    expect(api).toHaveBeenCalledWith(expect.stringContaining('character_id=mira'))
+    select('画师').props.onChange({ target: { value: 'wlop' } }); panel.render(GalleryPanel, { state }); panel.effects(); await settle()
+    expect(api).toHaveBeenCalledWith(expect.stringContaining('artist_id=wlop'))
+    panel.cleanup()
+  })
+})
+
+describe('library bulk export', () => {
+  it('waits for a pause in typing before requesting another library search', async () => {
+    const panel = harness()
+    mockLibrary([])
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    vi.mocked(api).mockClear()
+    nodes(panel.render(LibraryPanel, { state })).find((node) => node.type === 'input' && node.props?.['aria-label'] === '搜索资料')!.props.onChange({ target: { value: 'forest' } })
+    panel.render(LibraryPanel, { state }); panel.effects()
+    vi.advanceTimersByTime(299)
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    expect(api).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    expect(api).toHaveBeenCalledWith('/library/query?kind=all&query=forest&favorite=false&sort=updated&offset=0&limit=48')
+    panel.cleanup()
+  })
+
+  it('exports the current selection once and can recover from a failed download', async () => {
+    const pending = deferred<void>(), panel = harness()
+    mockLibrary([entry('one'), entry('two')])
+    vi.mocked(downloadPost).mockReturnValue(pending.promise)
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    button(panel.render(LibraryPanel, { state }), '选择当前结果').props.onClick()
+    const exportButton = button(panel.render(LibraryPanel, { state }), '导出所选 (2)')
+    exportButton.props.onClick(); exportButton.props.onClick()
+    button(panel.render(LibraryPanel, { state }), '导出全部').props.onClick()
+    expect(downloadPost).toHaveBeenCalledExactlyOnceWith('/library/export', { ids: ['one', 'two'] }, 'atelier-library-selection.zip')
+    expect(button(panel.render(LibraryPanel, { state }), '导出全部').props.disabled).toBe(true)
+    pending.reject(new Error('Export failed')); await settle()
+    expect(text(panel.render(LibraryPanel, { state }))).toContain('Export failed')
+    vi.mocked(downloadPost).mockResolvedValue(undefined)
+    button(panel.render(LibraryPanel, { state }), '导出所选 (2)').props.onClick(); await settle()
+    expect(downloadPost).toHaveBeenCalledTimes(2)
+    expect(text(panel.render(LibraryPanel, { state }))).not.toContain('Export failed')
+    expect(button(panel.render(LibraryPanel, { state }), '导出全部').props.disabled).toBe(false)
+    panel.cleanup()
+  })
+
+  it('prunes removed entries from the selection when rows are reloaded', async () => {
+    const panel = harness()
+    let entries = [entry('one'), entry('two')]
+    vi.mocked(api).mockImplementation(async (path, method) => {
+      if (method === 'DELETE') { entries = entries.filter((item) => item['id'] !== 'one'); return { deleted: true } as any }
+      if (String(path).startsWith('/library/query')) return libraryPage(entries) as any
+      if (path === '/library') return entries as any
+      return {} as any
+    })
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    button(panel.render(LibraryPanel, { state }), '选择当前结果').props.onClick()
+    nodes(panel.render(LibraryPanel, { state })).find((node) => node.type === 'button' && node.props?.title === '删除此资料')!.props.onClick({ stopPropagation() {} }); await settle()
+    expect(button(panel.render(LibraryPanel, { state }), '导出所选 (1)')).toBeTruthy()
+    button(panel.render(LibraryPanel, { state }), '导出所选 (1)').props.onClick(); await settle()
+    expect(downloadPost).toHaveBeenCalledWith('/library/export', { ids: ['two'] }, 'atelier-library-selection.zip')
+    panel.cleanup()
+  })
+})
+
+describe('library composition editing', () => {
+  const readOnlyValues = (tree: Rec) => nodes(tree).filter((node) => node.type === 'textarea' && node.props?.readOnly).map((node) => node.props.value)
+
+  it('previews unsaved branch inheritance and lets the user opt out without changing the parent', async () => {
+    const parent = { ...entry('parent'), data: { prompt: 'identity', negative_prompt: 'parent negative', examples: [] } }
+    const branch = { ...entry('branch'), kind: 'branch', parent_id: 'parent', data: { prompt: 'coat', negative_prompt: 'branch negative', examples: [] } }
+    const dialog = await libraryEditor(false, [branch, parent])
+    expect(readOnlyValues(dialog.render())).toEqual(['identity, coat', 'parent negative, branch negative'])
+    nodes(dialog.render()).find((node) => node.type === 'textarea' && node.props?.id === 'nai-lib-entry-prompt')!.props.onChange({ target: { value: 'cape' } })
+    expect(readOnlyValues(dialog.render())).toEqual(['identity, cape', 'parent negative, branch negative'])
+    component(dialog.render(), 'Toggle').props.onChange(false)
+    expect(readOnlyValues(dialog.render())).toEqual(['cape', 'branch negative'])
+    vi.mocked(api).mockClear()
+    button(dialog.render(), '保存').props.onClick(); await settle()
+    expect(api).toHaveBeenCalledWith('/library/branch', 'PUT', expect.objectContaining({ data: expect.objectContaining({ replace_identity: true, prompt: 'cape' }) }))
+    expect(parent.data.prompt).toBe('identity')
+    dialog.cleanup()
+  })
+
+  it('edits group negatives and previews the selected group with inherited identity', async () => {
+    const parent = { ...entry('parent'), data: { prompt: 'identity', negative_prompt: 'parent negative', examples: [] } }
+    const branch = { ...entry('branch'), kind: 'branch', parent_id: 'parent', data: { prompt: 'coat', prompt_sets: [{ name: 'Rain', prompt: 'raincoat', negative_prompt: 'old negative' }], examples: [] } }
+    const dialog = await libraryEditor(false, [branch, parent])
+    nodes(dialog.render()).find((node) => node.type === 'textarea' && node.props?.['aria-label'] === '词组 1 负面提示词')!.props.onChange({ target: { value: 'new negative' } })
+    nodes(dialog.render()).find((node) => node.type === 'select' && node.props?.value === '-1')!.props.onChange({ target: { value: '0' } })
+    expect(readOnlyValues(dialog.render())).toEqual(['identity, raincoat', 'parent negative, new negative'])
+    button(dialog.render(), '保存').props.onClick(); await settle()
+    expect(api).toHaveBeenCalledWith('/library/branch', 'PUT', expect.objectContaining({ data: expect.objectContaining({ prompt_sets: [{ name: 'Rain', prompt: 'raincoat', negative_prompt: 'new negative' }] }) }))
+    dialog.cleanup()
+  })
+
+  it('resets application to the main prompt when the selected group is deleted', async () => {
+    const grouped = { ...entry(), data: { prompt: 'main', prompt_sets: [{ name: 'Group', prompt: 'group' }], examples: [] } }
+    const dialog = await libraryEditor(false, [grouped])
+    nodes(dialog.render()).find((node) => node.type === 'select' && node.props?.value === '-1')!.props.onChange({ target: { value: '0' } })
+    expect(readOnlyValues(dialog.render())[0]).toBe('group')
+    button(dialog.render(), '删除').props.onClick()
+    expect(readOnlyValues(dialog.render())[0]).toBe('main')
+    const apply = vi.fn().mockResolvedValue(undefined)
+    dialog.editor.props.onApplyToDraft = apply
+    vi.mocked(api).mockResolvedValue({ ...grouped, revision: 2, data: { prompt: 'main', prompt_sets: [], examples: [] } } as any)
+    button(dialog.render(), '保存并填入草稿').props.onClick(); await settle()
+    expect(apply).toHaveBeenCalledWith(expect.anything(), -1)
+    dialog.cleanup()
+  })
+
+  it('uses referenced artist weights in the composed preview', async () => {
+    const blend = { ...entry('blend'), kind: 'blend', data: { prompt: '', artists: [{ id: 'artist', weight: 0.7 }], examples: [] } }
+    const artist = { ...entry('artist'), kind: 'artist', data: { prompt: 'artist:example', examples: [] } }
+    const dialog = await libraryEditor(false, [blend, artist])
+    expect(readOnlyValues(dialog.render())[0]).toBe('0.7::artist:example::')
+    dialog.cleanup()
   })
 })
 
@@ -325,6 +498,20 @@ describe('image and gallery async boundaries', () => {
     expect(button(result, '生成').props.disabled).toBe(true)
     expect(nodes(result).find((n) => n.props?.['aria-label'] === '执行当前操作')!.props.disabled).toBe(true)
     panel.cleanup(); vi.unstubAllGlobals()
+  })
+})
+
+describe('library card layout', () => {
+  it('lays out entries in the same adaptive masonry as the gallery', async () => {
+    mockLibrary([entry('character-a'), entry('character-b')])
+    const panel = harness()
+    panel.render(LibraryPanel, { state }); panel.effects(); await settle()
+    const tree = panel.render(LibraryPanel, { state })
+    const grid = nodes(tree).find((node) => node.props?.className === 'nai-lib-grid')!
+    expect(grid.props['data-layout']).toBe('masonry')
+    const cards = nodes(grid.props.children).filter((node) => node.props?.className === 'nai-lib-card')
+    expect(cards).toHaveLength(2)
+    panel.cleanup()
   })
 })
 

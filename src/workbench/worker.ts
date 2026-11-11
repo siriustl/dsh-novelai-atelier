@@ -121,7 +121,7 @@ export class Worker {
           const message = controller.signal.aborted ? 'AI 构思已中止，本轮未提交生图'
             : error instanceof JobNotSubmitted || (error as Error).name === 'AssistantError'
             ? (error as Error).message
-            : `AI 构思或参数校验失败 (${(error as Error).name})，本轮未提交生图`
+            : `AI 构思或参数校验失败：${String((error as Error).message ?? '').slice(0, 300) || (error as Error).name}，本轮未提交生图`
           this.store.finishScheduleRun(run, { error: message, cancelled: this.stopped || controller.signal.aborted, now: now ?? null })
         } finally {
           unsubscribe()

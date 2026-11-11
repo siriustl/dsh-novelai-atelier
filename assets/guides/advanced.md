@@ -14,7 +14,7 @@ The official behavior below was checked against all relevant image documentation
 | Improve detail while keeping the general image | Enhance | A second diffusion pass, optionally with a larger output; creative changes remain possible |
 | Increase dimensions with minimal creative reinterpretation | Dedicated Upscale | No prompt or generation-setting control; inspect fine details and alpha afterward |
 | Replace one hand, object, patch of background, or costume detail | Inpaint | Regenerate a mask-selected area using its surroundings as context |
-| Expand the scene beyond an existing edge | Outpainting through Inpaint | Enlarge the canvas locally, mask the new space, describe the extended scene |
+| Expand the scene beyond an existing edge | `nai_edit_image` with `operation:"outpaint"` | Set `image_path`, `left/right/top/bottom`, optional `seam_overlap` (32 by default), and the extended-scene prompt; the plugin prepares the canvas and mask |
 | Extract line art, recolor, adjust expression, remove background or clutter | Director Tools | Task-specific transformations; they can change more than the intended feature |
 | Carry over broad visual cues from an image | Vibe Transfer | Style, color, and composition guidance; not an identity lock |
 | Reuse a character's appearance or a specific style | Precise Reference on V4.5 | Stronger reference guidance, with strength/fidelity tradeoffs and per-reference cost |

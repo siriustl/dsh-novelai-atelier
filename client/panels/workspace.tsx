@@ -9,6 +9,8 @@ import { ImagePreview } from '../image.tsx'
 import { modelLabel, operationLabel } from '../format.ts'
 import { readPendingDraft, cachePendingDraft, clearPendingDraft } from '../draft-cache.ts'
 import { MaskEditor } from './mask.tsx'
+import { splitPromptText } from '../../src/core/promptText.ts'
+import { appendScenePrompt, appendPresetCharacters } from '../../src/workbench/library.ts'
 
 const MODELS = ['nai-diffusion-5-full', 'nai-diffusion-5-curated', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']
 const SAMPLERS: Array<[string, string]> = [
@@ -29,6 +31,7 @@ const SIZE_PRESETS: Array<[string, number, number]> = [
 const OPERATIONS: Array<[string, string]> = [
   ['generate', '文生图'],
   ['img2img', '图生图'],
+  ['outpaint', '扩图 (Outpaint)'],
   ['enhance', 'Enhance 增强'],
   ['upscale', '专用放大'],
   ['augment', '导演工具'],
@@ -36,7 +39,17 @@ const OPERATIONS: Array<[string, string]> = [
   ['reference_generate', '参考图生成'],
   ['encode_vibe', 'Vibe 编码'],
 ]
-const OPERATION_ICONS: Record<string, IconName> = { generate: 'sparkles', img2img: 'image', enhance: 'sliders', upscale: 'expand', augment: 'brush', inpaint: 'edit', reference_generate: 'layers', encode_vibe: 'layers' }
+const OPERATION_ICONS: Record<string, IconName> = {
+  generate: 'sparkles',
+  img2img: 'image',
+  outpaint: 'expand',
+  enhance: 'sliders',
+  upscale: 'expand',
+  augment: 'brush',
+  inpaint: 'edit',
+  reference_generate: 'layers',
+  encode_vibe: 'layers',
+}
 const AUG_TOOLS: Array<[string, string]> = [
   ['bg-removal', '背景去除'], ['lineart', '线稿化'], ['sketch', '素描化'], ['colorize', '上色'],
   ['emotion', '表情修改'], ['declutter', '去除杂物'], ['declutter-keep-bubbles', '除杂物（保留气泡）'],
@@ -45,9 +58,9 @@ const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'scared', 'surprised', 'ti
   'thinking', 'confused', 'shy', 'disgusted', 'smug', 'bored', 'laughing', 'irritated', 'aroused',
   'embarrassed', 'worried', 'love', 'determined', 'hurt', 'playful']
 /** Operations that carry the full prompt/parameter model. */
-const PROMPT_OPS = new Set(['generate', 'img2img', 'enhance', 'inpaint', 'reference_generate'])
+const PROMPT_OPS = new Set(['generate', 'img2img', 'outpaint', 'enhance', 'inpaint', 'reference_generate'])
 /** Operations that require a source image. */
-const IMAGE_OPS = new Set(['img2img', 'enhance', 'upscale', 'augment', 'inpaint', 'encode_vibe'])
+const IMAGE_OPS = new Set(['img2img', 'outpaint', 'enhance', 'upscale', 'augment', 'inpaint', 'encode_vibe'])
 const INPAINT_MODELS = ['nai-diffusion-5-full', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']
 /** Vibe/Precise references only exist on V4.5. */
 const REF_MODELS = ['nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']
@@ -57,6 +70,7 @@ const STATUS_TEXT: Rec = { queued: '排队', running: '执行中', completed: '�
 export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
   const r = R()
   const draft = state.draft!
+  const tokenReady = Boolean(state.settings?.['active_token_configured'] ?? state.settings?.['token_configured'])
   const cached = r.useMemo(() => {
     const pending = readPendingDraft(String(draft['id']))
     if (pending && pending['operation'] === draft['operation'] && JSON.stringify(pending['request']) === JSON.stringify(draft['request'])) { clearPendingDraft(String(draft['id'])); return null }
@@ -155,11 +169,18 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
   const setOperation = (op: string): void => {
     if (op === latestOperation.current) return
     const next = { ...latestRequest.current }
-    if (op === 'inpaint' && String(next['model']) === 'nai-diffusion-5-curated') next['model'] = 'nai-diffusion-5-full'
+    if (op === 'outpaint') {
+      for (const key of ['width', 'height', 'focus_box', 'focus_size', 'mask_path']) delete next[key]
+    }
+    if (op === 'augment') {
+      next['tool'] = next['tool'] ?? 'bg-removal'
+    }
+    if ((op === 'inpaint' || op === 'outpaint') && String(next['model']) === 'nai-diffusion-5-curated') next['model'] = 'nai-diffusion-5-full'
     if (op === 'reference_generate' || op === 'encode_vibe') {
       if (op === 'reference_generate' && ((next['characters'] ?? []) as Rec[]).length > 6) { setError('V4.5 最多支持 6 个角色，请先调整角色槽'); return }
       if (String(next['model']).startsWith('nai-diffusion-5')) next['model'] = 'nai-diffusion-4-5-full'
       next['transparent_background'] = false
+      next['v5_tier'] = 'high'
       if (next['quality_preset'] === 'light') next['quality_preset'] = 'standard'
     }
     latestRequest.current = next
@@ -194,6 +215,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
   const setModel = (model: string): void => {
     if (!model.startsWith('nai-diffusion-5-') && ((latestRequest.current['characters'] ?? []) as Rec[]).length > 6) { setError('V4.5 最多支持 6 个角色，请先调整角色槽'); return }
     const patch: Rec = { model }
+    if (model !== 'nai-diffusion-5-full') patch['v5_tier'] = 'high'
     if (model.startsWith('nai-diffusion-5-')) patch['variety_boost'] = false
     else {
       patch['transparent_background'] = false
@@ -262,6 +284,10 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
     if (submitting.current) return
     if (needsImage && !String(request['image_path'] ?? '')) { setError('请先上传源图'); return }
     if (operation === 'inpaint' && !String(request['mask_path'] ?? '')) { setError('请先绘制遮罩（标注要重绘的区域）'); return }
+    if (operation === 'outpaint') {
+      const hasAnyExtend = [request['left'], request['right'], request['top'], request['bottom']].some((v) => Number(v ?? 0) > 0)
+      if (!hasAnyExtend) { setError('扩图模式需要至少在一个方向延展像素（可点击上方快速预设）'); return }
+    }
     if (operation === 'reference_generate' && !((request['vibes'] as Rec[] ?? []).length || (request['precise_references'] as Rec[] ?? []).length)) {
       setError('参考图生成需要至少一个 Vibe 编码或参考图（在「角色与参考」里上传）'); return
     }
@@ -363,7 +389,9 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
   }
   const imageField = needsImage ? h('div', { className: 'nai-row', style: { marginBottom: 10 } },
     imagePath ? h('img', { alt: '图像预览', src: fileUrl(imagePath), style: { height: 72, borderRadius: 8, border: '1px solid var(--nai-border-soft)' } }) : null,
-    h('label', { className: 'nai-btn' }, busy === 'source' ? '上传中…' : imagePath ? '更换源图' : '＋ 上传源图',
+    h('label', { className: 'nai-btn', style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
+      h(Icon, { name: 'upload' }),
+      busy === 'source' ? '上传中…' : imagePath ? '更换源图' : '上传源图',
       h('input', {
         type: 'file', accept: 'image/png,image/jpeg,image/webp', className: 'nai-file-input',
         onChange: (e: Rec) => {
@@ -371,7 +399,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
           if (file) void uploadSource(file)
         },
       })),
-    imagePath ? Button({ small: true, ghost: true, onClick: () => { setPrepResult(null); setPrepareOpen(true) } }, '⧉ 准备画布') : null,
+    imagePath ? Button({ small: true, ghost: true, icon: 'sliders', onClick: () => { setPrepResult(null); setPrepareOpen(true) } }, '准备画布') : null,
     h('span', { className: 'hint', style: { color: 'var(--nai-faint)', fontSize: 11 } }, 'PNG / JPEG / WebP，原图不会被修改'),
   ) : null
 
@@ -388,7 +416,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
     opBody.push(
       Field({ label: '强度（Strength，重绘幅度）' }, Num({ value: request['strength'] ?? 0.7, onChange: setField('strength'), min: 0.01, max: 0.99, step: 0.01 })),
       Field({ label: '噪声（Noise）' }, Num({ value: request['noise'] ?? 0, onChange: setField('noise'), min: 0, max: 0.99, step: 0.01 })),
-      h(Toggle, { checked: Boolean(request['color_correct']), onChange: setField('color_correct'), label: '色彩校正（保持原图色调）' }),
+      Toggle({ checked: Boolean(request['color_correct']), onChange: setField('color_correct'), label: '色彩校正（保持原图色调）' }),
     )
   } else if (operation === 'enhance') {
     opBody.push(
@@ -399,7 +427,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
           ? [{ value: 'regular', label: '常规' }, { value: 'max', label: 'Max（仅 V5）' }]
           : [{ value: 'regular', label: '常规' }],
       })),
-      h(Toggle, { checked: request['append_enhance_tags'] !== false, onChange: setField('append_enhance_tags'), label: '自动追加增强 tag' }),
+      Toggle({ checked: request['append_enhance_tags'] !== false, onChange: setField('append_enhance_tags'), label: '自动追加增强 tag' }),
     )
   } else if (operation === 'upscale') {
     opBody.push(h('span', { className: 'hint', style: { color: 'var(--nai-faint)', fontSize: 11 } }, '使用 NovelAI 官方放大（约 2×），按结果扣费。'))
@@ -410,7 +438,27 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
         value: String(request['mask_mode'] ?? 'luminance'), onChange: setField('mask_mode'),
         options: [{ value: 'luminance', label: '亮度（推荐）' }, { value: 'alpha', label: '透明度' }],
       })),
-      h(Toggle, { checked: request['color_correct'] !== false, onChange: setField('color_correct'), label: '色彩校正' }),
+      Toggle({ checked: request['color_correct'] !== false, onChange: setField('color_correct'), label: '色彩校正' }),
+    )
+  } else if (operation === 'outpaint') {
+    opBody.push(
+      h('div', { style: { width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' } },
+        h('div', { style: { fontSize: 11, color: 'var(--nai-faint)' } }, '设置四向扩展像素（会自动对齐到 64 倍数，带 32px 智能接缝过渡）：'),
+        h('div', { className: 'nai-grid', style: { gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' } },
+          Field({ label: '向上 (Top)' }, Num({ value: request['top'] ?? 0, onChange: setField('top'), min: 0, max: 2048, step: 64 })),
+          Field({ label: '向下 (Bottom)' }, Num({ value: request['bottom'] ?? 0, onChange: setField('bottom'), min: 0, max: 2048, step: 64 })),
+          Field({ label: '向左 (Left)' }, Num({ value: request['left'] ?? 0, onChange: setField('left'), min: 0, max: 2048, step: 64 })),
+          Field({ label: '向右 (Right)' }, Num({ value: request['right'] ?? 0, onChange: setField('right'), min: 0, max: 2048, step: 64 })),
+        ),
+        h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px' } },
+          Button({ small: true, ghost: true, onClick: () => set({ left: 256, right: 256, top: 0, bottom: 0 }) }, '左右各扩 256 (宽屏)'),
+          Button({ small: true, ghost: true, onClick: () => set({ left: 0, right: 0, top: 192, bottom: 192 }) }, '上下各扩 192 (竖图)'),
+          Button({ small: true, ghost: true, onClick: () => set({ left: 128, right: 128, top: 128, bottom: 128 }) }, '四向各扩 128'),
+        ),
+        Field({ label: '接缝过渡重绘宽度 (Seam Overlap，默认 32px)' }, Num({ value: request['seam_overlap'] ?? 32, onChange: setField('seam_overlap'), min: 0, max: 128, step: 8 })),
+        Field({ label: '扩展重绘强度' }, Num({ value: request['strength'] ?? 1, onChange: setField('strength'), min: 0, max: 1, step: 0.05 })),
+        Toggle({ checked: request['color_correct'] !== false, onChange: setField('color_correct'), label: '色彩校正' }),
+      ),
     )
   } else if (operation === 'augment') {
     opBody.push(
@@ -430,7 +478,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
   } else if (operation === 'reference_generate') {
     opBody.push(
       h('span', { className: 'hint', style: { color: 'var(--nai-faint)', fontSize: 11 } }, 'V4.5 专用：在「角色与参考」里上传 Vibe 编码（.vibe/.naiv4vibe）或参考图，配合提示词生成。'),
-      h(Toggle, { checked: request['normalize_vibe_strengths'] !== false, onChange: setField('normalize_vibe_strengths'), label: '归一化 Vibe 强度' }),
+      Toggle({ checked: request['normalize_vibe_strengths'] !== false, onChange: setField('normalize_vibe_strengths'), label: '归一化 Vibe 强度' }),
     )
   }
 
@@ -443,7 +491,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
         h('div', { className: 'nai-save-state', 'data-save-status': saveStatus, role: 'status' },
           h(Icon, { name: saveStatus === 'failed' ? 'alert' : saveStatus === 'saving' ? 'loader' : 'check', className: saveStatus === 'saving' ? 'nai-spin' : '' }),
           saveStatus === 'failed' ? '未同步' : saveStatus === 'saving' ? '同步中' : '已同步'),
-        Button({ icon: 'play', iconOnly: true, kind: 'primary', title: '执行当前操作', disabled: busy !== '' || saveStatus === 'failed' || !state.settings?.['token_configured'], onClick: () => void doSubmit() }))),
+        Button({ icon: 'play', iconOnly: true, kind: 'primary', title: '执行当前操作', disabled: busy !== '' || saveStatus === 'failed' || !tokenReady, onClick: () => void doSubmit() }))),
     saveStatus === 'failed' ? h('div', { className: 'nai-save-recovery', role: 'alert' },
       h('div', null, h('strong', null, '本地编辑尚未保存'), h('p', null, saver.error)),
       h('div', { className: 'nai-row' },
@@ -463,7 +511,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
       needsImage ? h('div', { style: { height: 10 } }) : null,
       imageField,
       maskField,
-      opBody.length ? h('div', { className: 'nai-row', style: { marginTop: needsImage ? 8 : 0 } }, opBody) : null,
+      opBody.length ? h('div', { className: 'nai-row', style: { marginTop: needsImage ? 8 : 0 } }, ...opBody) : null,
     ),
     promptOp ? Card({ title: '画面', className: 'nai-workspace-prompt' },
       h('div', { className: 'nai-prompt' },
@@ -473,15 +521,17 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
             value: String(request['prompt'] ?? ''),
             onChange: (e: Rec) => set({ prompt: (e.target as HTMLTextAreaElement).value }),
             onKeyDown: (e: Rec) => {
-              if ((e as KeyboardEvent).ctrlKey && (e as KeyboardEvent).key === 'Enter' && state.settings?.['token_configured'] && busy === '') { e.preventDefault(); void doSubmit() }
+              if (((e as KeyboardEvent).ctrlKey || (e as KeyboardEvent).metaKey) && (e as KeyboardEvent).key === 'Enter' && tokenReady && busy === '') { e.preventDefault(); void doSubmit() }
             },
             placeholder: '描述画面内容…支持 tag 与自然语言混合',
           })),
         h('div', { className: 'prompt-meta' }, `${String(request['prompt'] ?? '').length} 字符`,
           state.saveToLibrary ? Button({ small: true, icon: 'library', kind: 'ghost', disabled: !String(request['prompt'] ?? '').trim(), onClick: () => state.saveToLibrary!({ kind: 'preset', name: '', data: { prompt: String(latestRequest.current['prompt'] ?? ''), negative_prompt: String(latestRequest.current['negative_prompt'] ?? ''), prompt_sets: [], examples: [], notes: '' } }) }, '存入资料库') : null),
         h('div', { style: { height: 8 } }),
-        Field({ label: '负面提示词（不想要的内容）' },
+        Field({ label: '负面提示词（不想要的内容）', hint: isV5 && request['v5_tier'] === 'medium' ? 'Medium 使用固定 Heavy 预设；自定义负面词保留在草稿，切回 High 后生效' : undefined },
           h('textarea', {
+            id: 'nai-negative-prompt',
+            disabled: isV5 && request['v5_tier'] === 'medium',
             value: String(request['negative_prompt'] ?? ''),
             style: { minHeight: 44 },
             onChange: (e: Rec) => set({ negative_prompt: (e.target as HTMLTextAreaElement).value }),
@@ -492,9 +542,23 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
       h('div', { className: 'nai-grid', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' } },
         Field({ label: '模型' }, Select({
           value: String(effectiveModel), onChange: setModel,
-          options: (operation === 'inpaint' ? INPAINT_MODELS : operation === 'reference_generate' ? REF_MODELS : MODELS).map((m) => ({ value: m, label: modelLabel(m) })),
+          options: ((operation === 'inpaint' || operation === 'outpaint') ? INPAINT_MODELS : operation === 'reference_generate' ? REF_MODELS : MODELS).map((m) => ({ value: m, label: modelLabel(m) })),
         })),
-        operation === 'inpaint' ? null : (() => {
+        effectiveModel === 'nai-diffusion-5-full' ? Field({ label: 'V5 档位' }, Select({
+          value: String(request['v5_tier'] ?? 'high'),
+          onChange: (tier: string) => {
+            if (tier === 'medium') {
+              set({ v5_tier: 'medium', steps: 14, sampler: 'k_euler_ancestral', cfg_rescale: 0 })
+            } else {
+              set({ v5_tier: 'high', steps: undefined })
+            }
+          },
+          options: [
+            { value: 'high', label: 'High (全功能调控)' },
+            { value: 'medium', label: 'Medium (轻量速览 · 锁定14步)' },
+          ],
+        })) : null,
+        operation === 'inpaint' || operation === 'outpaint' ? null : (() => {
           const width = request['width'] ?? (needsImage ? null : 832)
           const height = request['height'] ?? (needsImage ? null : 1216)
           const autoSize = width === null && height === null
@@ -519,10 +583,27 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
             ],
           }))
         })(),
-        Field({ label: '步数' }, Num({ value: request['steps'] ?? null, onChange: setField('steps'), min: 1, max: 50, placeholder: '默认 23' })),
+        Field({
+          label: '步数',
+          hint: (isV5 && request['v5_tier'] === 'medium') ? 'Medium 档位固定 14 步' : undefined,
+        }, Num({
+          value: (isV5 && request['v5_tier'] === 'medium') ? 14 : (request['steps'] ?? null),
+          onChange: (isV5 && request['v5_tier'] === 'medium') ? () => {} : (setField('steps') as (v: number | null) => void),
+          disabled: isV5 && request['v5_tier'] === 'medium',
+          min: 1, max: 50,
+          placeholder: (isV5 && request['v5_tier'] === 'medium') ? '锁定 14' : '默认 23',
+        })),
         Field({ label: '引导强度' }, Num({ value: request['scale'] ?? null, onChange: setField('scale'), min: 0, max: 10, step: 0.1, placeholder: isV5 ? '默认 7' : '默认 5' })),
         Field({ label: '种子' }, Num({ value: request['seed'] ?? null, onChange: setField('seed'), min: 0, max: 4294967295, placeholder: '随机' })),
-        Field({ label: '采样器' }, Select({ value: String(request['sampler'] ?? 'k_euler_ancestral'), onChange: setField('sampler'), options: SAMPLERS.map(([v, l]) => ({ value: v, label: l })) })),
+        Field({
+          label: '采样器',
+          hint: (isV5 && request['v5_tier'] === 'medium') ? 'Medium 档位固定 Euler A' : undefined,
+        }, Select({
+          value: (isV5 && request['v5_tier'] === 'medium') ? 'k_euler_ancestral' : String(request['sampler'] ?? 'k_euler_ancestral'),
+          onChange: (isV5 && request['v5_tier'] === 'medium') ? () => {} : (setField('sampler') as (v: string) => void),
+          disabled: isV5 && request['v5_tier'] === 'medium',
+          options: SAMPLERS.map(([v, l]) => ({ value: v, label: l })),
+        })),
       ),
       h('details', { className: 'nai-adv' },
         h('summary', null, '高级参数'),
@@ -535,26 +616,33 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
               options: [{ value: 'standard', label: '标准' }, ...(isV5 ? [{ value: 'light', label: '轻度' }] : []), { value: 'none', label: '关闭' }],
             })),
             Field({ label: '负面预设' }, Select({
-              value: String(request['negative_preset'] ?? 'heavy'), onChange: setField('negative_preset'),
+              value: isV5 && request['v5_tier'] === 'medium' ? 'heavy' : String(request['negative_preset'] ?? 'heavy'),
+              disabled: isV5 && request['v5_tier'] === 'medium', onChange: setField('negative_preset'),
               options: [{ value: 'heavy', label: 'Heavy（推荐）' }, { value: 'light', label: 'Light' },
                 { value: 'humanFocus', label: 'Human Focus' }, ...(effectiveModel === 'nai-diffusion-4-5-curated' ? [] : [{ value: 'furryFocus', label: 'Furry Focus' }]),
                 { value: 'none', label: '关闭' }].map((o) => o as { value: string; label: string }),
             })),
-            Field({ label: 'CFG Rescale' }, Num({ value: request['cfg_rescale'] ?? 0, onChange: setField('cfg_rescale'), min: 0, max: 1, step: 0.05 })),
+            Field({ label: 'CFG Rescale', hint: (isV5 && request['v5_tier'] === 'medium') ? 'Medium 档位固定 0' : undefined },
+              Num({
+                value: (isV5 && request['v5_tier'] === 'medium') ? 0 : (request['cfg_rescale'] ?? 0),
+                onChange: (isV5 && request['v5_tier'] === 'medium') ? () => {} : (setField('cfg_rescale') as (v: number | null) => void),
+                disabled: isV5 && request['v5_tier'] === 'medium',
+                min: 0, max: 1, step: 0.05,
+              })),
           ),
           h('div', { className: 'nai-row', style: { marginTop: 10 } },
-            !isV5 ? h(Toggle, { checked: Boolean(request['variety_boost']), onChange: setField('variety_boost'), label: '多样性增强' }) : null,
-            isV5 ? h(Toggle, { checked: Boolean(request['transparent_background']), onChange: setField('transparent_background'), label: '透明背景' }) : null,
+            !isV5 ? Toggle({ checked: Boolean(request['variety_boost']), onChange: setField('variety_boost'), label: '多样性增强' }) : null,
+            isV5 ? Toggle({ checked: Boolean(request['transparent_background']), onChange: setField('transparent_background'), label: '透明背景' }) : null,
           ),
         ),
       ),
     ) : null,
     promptOp ? Card({ title: '角色与参考', className: 'nai-workspace-references' },
-      h('div', { className: 'nai-row' },
-        Button({ onClick: () => openLibrary('character') }, '＋ 从资料库选角色'),
-        Button({ onClick: () => openLibrary('artist') }, '＋ 从资料库选画师'),
-        Button({ onClick: () => openLibrary('blend') }, '＋ 画师混合'),
-        Button({ onClick: () => setUploadOpen(true) }, '＋ 上传参考图 / Vibe'),
+      h('div', { className: 'nai-row', style: { gap: 6, flexWrap: 'wrap' } },
+        Button({ small: true, icon: 'users', onClick: () => openLibrary('character') }, '从资料库选角色'),
+        Button({ small: true, icon: 'brush', onClick: () => openLibrary('artist') }, '从资料库选画师'),
+        Button({ small: true, icon: 'layers', onClick: () => openLibrary('blend') }, '画师混合'),
+        Button({ small: true, icon: 'upload', onClick: () => setUploadOpen(true) }, '上传参考图 / Vibe'),
       ),
       h('div', { style: { height: 8 } }),
       h(CharacterEditor, { request, set, isV5, saveToLibrary: state.saveToLibrary }),
@@ -581,6 +669,11 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
         h(ImagePreview, { src: assetUrl(String(latestAsset['id'])), alt: String((latestArtwork!['request'] as Rec)?.['prompt'] || '最近生成作品') })),
       h('div', { className: 'nai-artwork-caption' }, h('span', null, operationLabel(latestArtwork!['operation'])), Button({ small: true, icon: 'eye', kind: 'ghost', onClick: () => state.go('gallery', String(latestArtwork!['id'])) }, '查看作品'))) : null,
     Card({ title: '生成设置', className: 'nai-workspace-submit' },
+      Field({ label: '本任务分类目录（可选）' }, h('input', {
+        type: 'text', value: String(request['output_subdir'] ?? ''),
+        placeholder: '留空使用图片输出目录；例如 portraits',
+        onChange: (e: Rec) => set({ output_subdir: (e.target as HTMLInputElement).value || undefined }),
+      })),
       h('div', { className: 'nai-row' },
         IMAGE_OPS.has(operation) ? null : Field({ label: '数量' }, Num({ value: count, onChange: (v) => setCount(v ?? 1), min: 1, max: 50, style: { width: 70 } })),
         IMAGE_OPS.has(operation) ? null : Field({ label: '种子模式' }, Select({
@@ -594,8 +687,8 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
         Button({ icon: 'check', kind: 'ghost', onClick: () => void doValidate(), disabled: busy !== '' || saveStatus === 'failed' }, busy === 'validate' ? '校验中…' : '校验参数'),
         h('span', { style: { flex: 1 } }),
         Button({
-          kind: 'primary', icon: 'play', onClick: () => void doSubmit(), disabled: busy !== '' || saveStatus === 'failed' || !state.settings?.['token_configured'],
-          title: state.settings?.['token_configured'] ? '' : '请先在设置中配置 NovelAI 令牌',
+          kind: 'primary', icon: 'play', onClick: () => void doSubmit(), disabled: busy !== '' || saveStatus === 'failed' || !tokenReady,
+          title: tokenReady ? '' : '请先为 Agent 默认接口配置令牌',
         }, busy === 'submit' ? '提交中…' : operation === 'encode_vibe' ? '开始编码' : operation === 'upscale' ? '开始放大' : effectiveCount > 1 ? '逐张生成' : '生成'),
       ),
       recentJobs.length ? h('div', { className: 'nai-jobs-strip' }, recentJobs.map((job) => {
@@ -609,7 +702,7 @@ export function WorkspacePanel({ state }: { state: WorkbenchState }): Rec {
           style: { cursor: 'pointer' },
           onClick: () => state.go('gallery', String(job['id'])),
         },
-          asset ? h('img', { alt: '图像预览', src: assetThumb(String(asset['id'])) }) : h('span', { className: 'st-run', style: { opacity: 0.55 } }, job['operation'] === 'encode_vibe' ? '♪' : '·'),
+          asset ? h('img', { alt: '图像预览', src: assetThumb(String(asset['id'])) }) : h('span', { className: 'st-run', style: { opacity: 0.55 } }, job['operation'] === 'encode_vibe' ? h(Icon, { name: 'layers', size: 12 }) : '·'),
           h('span', { className: cls }, STATUS_TEXT[st] ?? st),
           h('span', { style: { color: 'var(--nai-faint)' } }, '#' + String(job['id']).slice(0, 6)))
       })) : null,
@@ -689,8 +782,9 @@ function applyEntryToRequest(request: Rec, entry: Rec): Rec {
     characters.push({ prompt, negative_prompt: negative })
     req['characters'] = characters
   } else {
-    req['prompt'] = [req['prompt'], prompt].filter(Boolean).join(', ')
+    req['prompt'] = appendScenePrompt(String(req['prompt'] ?? ''), prompt)
     req['negative_prompt'] = [req['negative_prompt'], negative].filter(Boolean).join(', ')
+    if (entry['kind'] === 'preset') appendPresetCharacters(req, data)
   }
   return req
 }
@@ -700,6 +794,17 @@ function CharacterEditor({ request, set, isV5, saveToLibrary }: { request: Rec; 
   const characters = structuredClone((request['characters'] ?? []) as Rec[])
   const update = (): void => set({ characters })
   const limit = isV5 ? 22 : 6
+  const flattenToMainPrompt = (): void => {
+    if (characters.length === 0) return
+    const [curPrompt, text] = splitPromptText(String(request['prompt'] ?? '').trim())
+    const curUc = String(request['negative_prompt'] ?? '').trim()
+    const charPrompts = characters.map((c) => String(c['prompt'] ?? '').trim()).filter(Boolean)
+    const charUcs = characters.map((c) => String(c['negative_prompt'] ?? '').trim()).filter(Boolean)
+    const scene = [curPrompt, ...charPrompts].filter(Boolean).join(', ')
+    const newPrompt = text === null ? scene : `${scene}${scene ? '\n' : ''}Text: ${text}`
+    const newUc = [curUc, ...charUcs].filter(Boolean).join(', ')
+    set({ prompt: newPrompt, negative_prompt: newUc, characters: [] })
+  }
   return h('div', null,
     characters.length === 0 ? h('div', { className: 'nai-empty', style: { padding: '8px 0' } }, '无独立角色（使用单一画面提示词）') : null,
     characters.map((c, i) => h('div', {
@@ -713,10 +818,12 @@ function CharacterEditor({ request, set, isV5, saveToLibrary }: { request: Rec; 
       },
     },
       h('div', { className: 'nai-row', style: { marginBottom: 6 } },
-        h('span', { className: 'nai-pill', style: { fontSize: 11, fontWeight: 'bold', color: 'var(--nai-accent)' } }, `👤 角色 ${i + 1}`),
+        h('span', { className: 'nai-pill', style: { fontSize: 11, fontWeight: 'bold', color: 'var(--nai-accent)', display: 'inline-flex', alignItems: 'center', gap: 4 } },
+          h(Icon, { name: 'users', size: 13 }),
+          `角色 ${i + 1}`),
         h('span', { style: { flex: 1 } }),
         saveToLibrary ? Button({ small: true, icon: 'library', kind: 'ghost', disabled: !String(c['prompt'] ?? '').trim(), onClick: () => saveToLibrary({ kind: 'character', name: '', data: { prompt: String(c['prompt'] ?? ''), negative_prompt: String(c['negative_prompt'] ?? ''), prompt_sets: [], examples: [], notes: '' } }) }, '存入资料库') : null,
-        Button({ small: true, kind: 'danger', onClick: () => { characters.splice(i, 1); update() } }, '移除角色')),
+        Button({ small: true, kind: 'danger', icon: 'trash', onClick: () => { characters.splice(i, 1); update() } }, '移除角色')),
       h('div', { className: 'nai-grid', style: { gridTemplateColumns: '1fr 1fr', marginTop: 6 } },
         Field({ label: '角色提示词' }, h('textarea', {
           value: String(c['prompt'] ?? ''), style: { minHeight: 52 },
@@ -725,6 +832,7 @@ function CharacterEditor({ request, set, isV5, saveToLibrary }: { request: Rec; 
         })),
         Field({ label: '角色负面词（通常留空即可）' }, h('textarea', {
           value: String(c['negative_prompt'] ?? ''), style: { minHeight: 52 },
+          disabled: isV5 && request['v5_tier'] === 'medium',
           placeholder: '针对该角色的负面元素（非必需）…',
           onChange: (e: Rec) => { c['negative_prompt'] = (e.target as HTMLTextAreaElement).value; update() },
         }))),
@@ -736,9 +844,14 @@ function CharacterEditor({ request, set, isV5, saveToLibrary }: { request: Rec; 
         Num({ value: c['y'] ?? null, onChange: (v) => { c['y'] = v; update() }, min: 0, max: 1, step: 0.1, style: { width: 72 } }),
       ) : null,
     )),
-    characters.length < limit
-      ? Button({ style: { marginTop: 8 }, onClick: () => { characters.push({ prompt: '', negative_prompt: '' }); update() } }, `＋ 添加角色（${characters.length}/${limit}）`)
-      : h('div', { className: 'hint', style: { marginTop: 6, color: 'var(--nai-faint)', fontSize: 11 } }, `已达模型角色上限 ${limit}`),
+    h('div', { className: 'nai-row', style: { marginTop: 8, gap: 8 } },
+      characters.length < limit
+        ? Button({ small: true, icon: 'plus', onClick: () => { characters.push({ prompt: '', negative_prompt: '' }); update() } }, `添加角色 (${characters.length}/${limit})`)
+        : h('div', { className: 'hint', style: { color: 'var(--nai-faint)', fontSize: 11 } }, `已达模型角色上限 ${limit}`),
+      characters.length > 0
+        ? Button({ small: true, icon: 'list', title: '将当前角色槽提示词展平合并到主提示词中（单人出图更自然，或用于 V4.5）', onClick: flattenToMainPrompt }, '展平到主提示词')
+        : null,
+    ),
   )
 }
 

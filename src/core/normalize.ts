@@ -28,6 +28,9 @@ export const MODEL_ALIASES: Record<string, string> = {
   v5: 'nai-diffusion-5-full',
   'v5-full': 'nai-diffusion-5-full',
   'v5_full': 'nai-diffusion-5-full',
+  'v5-medium': 'nai-diffusion-5-full',
+  'v5_medium': 'nai-diffusion-5-full',
+  'nai-diffusion-5-full-medium': 'nai-diffusion-5-full',
   'v5-curated': 'nai-diffusion-5-curated',
   'v5_curated': 'nai-diffusion-5-curated',
   'nai-diffusion-5-full': 'nai-diffusion-5-full',
@@ -69,8 +72,9 @@ export function normalizeRequest(raw: Rec | null | undefined, reservedKeys: stri
 
   // Normalize model
   if (typeof merged['model'] === 'string') {
-    const key = merged['model'].trim().toLowerCase()
-    if (Object.hasOwn(MODEL_ALIASES, key)) merged['model'] = MODEL_ALIASES[key]
+    const rawModelKey = merged['model'].trim().toLowerCase()
+    if (rawModelKey.includes('medium')) merged['v5_tier'] = 'medium'
+    if (Object.hasOwn(MODEL_ALIASES, rawModelKey)) merged['model'] = MODEL_ALIASES[rawModelKey]
   }
 
   // Normalize sampler

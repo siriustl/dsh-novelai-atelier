@@ -2,9 +2,11 @@
 import { R, Button, h, ErrorBox, Spinner, Modal } from './ui.tsx'
 import { api, type Rec } from './api.ts'
 import { Icon, type IconName } from './icons.tsx'
+import { AtelierGlyph } from './brand.tsx'
 import { dateTimeLabel } from './format.ts'
 import { WorkspacePanel } from './panels/workspace.tsx'
 import { GalleryPanel } from './panels/gallery.tsx'
+import { InspirationPanel } from './panels/inspiration.tsx'
 import { LibraryPanel } from './panels/library.tsx'
 import { DraftsPanel } from './panels/drafts.tsx'
 import { SchedulesPanel } from './panels/schedules.tsx'
@@ -23,14 +25,16 @@ export interface WorkbenchState {
   go: (page: string, jobId?: string) => void
   clearError?: () => void
   focusJobId?: string | null
+  clearFocusJob?: () => void
   guardNavigation?: (guard: () => Promise<boolean>) => () => void
   librarySeed?: Rec | null
   clearLibrarySeed?: () => void
   saveToLibrary?: (entry: Rec) => void
+  setPanel?: (page: string) => void
 }
 
 const PAGES: Array<[string, IconName, string]> = [
-  ['create', 'brush', '创作'], ['gallery', 'image', '画廊'], ['library', 'library', '资料库'],
+  ['create', 'brush', '创作'], ['gallery', 'image', '画廊'], ['inspiration', 'sparkles', '灵感'], ['library', 'library', '资料库'],
   ['drafts', 'files', '草稿'], ['schedules', 'calendar', '定时任务'], ['settings', 'settings', '设置'],
 ]
 
@@ -59,7 +63,11 @@ export function Shell(): Rec {
   const alive = r.useRef(true)
   const controllers = r.useRef(new Set<AbortController>())
   const navigationGuard = r.useRef<(() => Promise<boolean>) | null>(null)
-  const tokenConfigured = Boolean(boot?.['settings']?.['token_configured'])
+  const settingsSnapshot = (boot?.['settings'] ?? {}) as Rec
+  // Generation runs on the active endpoint, so the pill must follow that endpoint,
+  // not "some endpoint has a token".
+  const tokenConfigured = Boolean(settingsSnapshot['active_token_configured'] ?? settingsSnapshot['token_configured'])
+  const activeEndpointName = String(settingsSnapshot['active_endpoint_name'] ?? '')
   const tokenReady = r.useRef(tokenConfigured)
   tokenReady.current = tokenConfigured
   const visible = (): boolean => typeof document === 'undefined' || document.visibilityState !== 'hidden'
@@ -142,10 +150,16 @@ export function Shell(): Rec {
 
   const draft = boot['draft'] as Rec
   const settings = boot['settings'] as Rec
-  const state: WorkbenchState = { bootstrap: boot, draft, settings, assets: boot['assets'] as Rec[] ?? [], paused, error, refresh, patchDraft, fail, go, focusJobId, clearError: () => setError(null), guardNavigation, librarySeed, clearLibrarySeed: () => setLibrarySeed(null), saveToLibrary }
+  const state: WorkbenchState = {
+    bootstrap: boot, draft, settings, assets: boot['assets'] as Rec[] ?? [],
+    paused, error, refresh, patchDraft, fail, go, focusJobId,
+    clearFocusJob: () => setFocusJobId(null),
+    clearError: () => setError(null), guardNavigation, librarySeed,
+    clearLibrarySeed: () => setLibrarySeed(null), saveToLibrary,
+    setPanel: (p) => go(p),
+  }
   const anlas = credits?.['anlas'] as Rec | undefined
   const totalAnlas = anlas?.['total']
-  const v5 = credits?.['v5_usage_summary'] as Rec | undefined
   const activeJobs = Number(boot['summary']?.['active_jobs'] ?? ((boot['jobs'] ?? []) as Rec[]).filter((job) => ['queued', 'running'].includes(String(job['status']))).length)
   const queue = (boot['queue'] ?? {}) as Rec
   const pauseReason = paused && queue['reason'] ? String(queue['reason']) : null
@@ -153,10 +167,10 @@ export function Shell(): Rec {
   return h('div', { className: 'nai-root', 'data-page': page },
     h('div', { className: 'nai-shell' },
       h('header', { className: 'nai-topbar' },
-        h('div', { className: 'brand' }, h('span', { className: 'nai-brand-mark' }, h(Icon, { name: 'brush', size: 20 })), h('span', { className: 'nai-brand-name' }, 'NovelAI Atelier'), h('span', { className: 'nai-brand-version' }, `v${boot['version']}`)),
+        h('div', { className: 'brand' }, h('span', { className: 'nai-brand-mark' }, h(AtelierGlyph, { size: 19 })), h('span', { className: 'nai-brand-name' }, 'NovelAI Atelier'), h('span', { className: 'nai-brand-version' }, `v${boot['version']}`)),
         h('div', { className: 'nai-topbar-actions' },
           h('button', { type: 'button', className: `nai-pill ${paused ? 'bad' : 'ok'}`, 'aria-pressed': paused, disabled: pausing, title: paused ? pauseReason ?? '恢复任务' : '暂停后续任务', onClick: () => void togglePause() }, h(Icon, { name: paused ? 'play' : 'pause' }), paused ? '已暂停' : activeJobs ? `${activeJobs} 个任务` : '就绪'),
-          h('button', { type: 'button', className: `nai-pill ${creditsError ? 'bad' : ''}`, title: creditsError ?? (tokenConfigured ? '查看账户额度' : '配置 NovelAI 令牌'), onClick: () => { if (tokenConfigured) { setCreditsOpen(true); void loadCredits() } else go('settings') } }, h(Icon, { name: tokenConfigured ? creditsError ? 'alert' : 'coins' : 'settings' }), !tokenConfigured ? '配置令牌' : creditsError ? '额度查询失败' : totalAnlas == null ? '令牌已配置' : `${Number(totalAnlas).toLocaleString('zh-CN')} Anlas`))),
+          h('button', { type: 'button', className: `nai-pill ${creditsError ? 'bad' : ''}`, title: creditsError ?? (tokenConfigured ? `${activeEndpointName || '默认接口'} · 查看各接口额度` : '配置 NovelAI 接口'), onClick: () => { if (tokenConfigured) { setCreditsOpen(true); void loadCredits() } else go('settings') } }, h(Icon, { name: tokenConfigured ? creditsError ? 'alert' : 'coins' : 'settings' }), !tokenConfigured ? '配置接口' : creditsError ? '额度查询失败' : totalAnlas == null ? '令牌已配置' : `${Number(totalAnlas).toLocaleString('zh-CN')} Anlas`))),
       error || connectionError || boot['worker_error'] ? h('div', { className: 'nai-shell-error' }, ErrorBox({ error: error ?? connectionError ?? String(boot['worker_error']) }), Button({ icon: error ? 'close' : 'refresh', iconOnly: true, kind: 'ghost', title: error ? '关闭提示' : '重新连接', onClick: () => error ? setError(null) : void refresh() })) : null,
       pauseReason ? h('div', { className: 'nai-shell-error', role: 'status' }, pauseReason) : null,
       h('div', { className: 'nai-body' },
@@ -164,20 +178,53 @@ export function Shell(): Rec {
         h('main', { className: 'nai-main' },
           page === 'create' ? h(WorkspacePanel, { key: String(draft['id']), state }) : null,
           page === 'gallery' ? h(GalleryPanel, { state }) : null,
+          page === 'inspiration' ? h(InspirationPanel, { state }) : null,
           page === 'library' ? h(LibraryPanel, { state }) : null,
           page === 'drafts' ? h(DraftsPanel, { state }) : null,
           page === 'schedules' ? h(SchedulesPanel, { state }) : null,
           page === 'settings' ? h(SettingsPanel, { state }) : null))),
-    creditsOpen ? h(Modal, { title: 'NovelAI 额度', onClose: () => setCreditsOpen(false), footer: h('div', { className: 'modal-actions' }, Button({ small: true, icon: 'refresh', disabled: creditsBusy, onClick: () => void loadCredits() }, creditsBusy ? '刷新中…' : '刷新额度'), Button({ onClick: () => setCreditsOpen(false) }, '关闭')) },
+    creditsOpen ? h(Modal, { title: '接口额度', onClose: () => setCreditsOpen(false), footer: h('div', { className: 'modal-actions' }, Button({ small: true, icon: 'refresh', disabled: creditsBusy, onClick: () => void loadCredits() }, creditsBusy ? '刷新中…' : '刷新全部'), Button({ onClick: () => setCreditsOpen(false) }, '关闭')) },
       ErrorBox({ error: creditsError }),
-      credits === null ? h('div', { className: 'nai-empty' }, creditsBusy ? '正在查询额度' : '暂无额度数据') : h('div', { className: 'nai-kv' },
-        h('span', { className: 'k' }, '订阅档位'), h('span', null, credits['tier'] === 3 ? `Opus${credits['active'] ? ' · 生效中' : ' · 未生效'}` : `Tier ${credits['tier'] ?? '—'}`),
-        h('span', { className: 'k' }, '订阅额度'), h('span', null, anlas?.['subscription'] ?? '—'),
-        h('span', { className: 'k' }, '购买额度'), h('span', null, anlas?.['purchased'] ?? '—'),
-        h('span', { className: 'k' }, '总余额'), h('strong', null, totalAnlas == null ? '—' : `${totalAnlas} Anlas`),
-        v5 ? h('span', { className: 'k' }, 'V5 额度池') : null,
-        v5 ? h('span', null, v5['pool_available'] === true ? '当前可用' : v5['pool_available'] === false ? '已用尽' : '未确认', v5['remaining_percent'] != null ? ` · 剩余 ${Number(v5['remaining_percent']).toFixed(1)}%` : '') : null,
-        v5?.['refill_percentage_points_per_day'] != null ? h('span', { className: 'k' }, '每日回充') : null,
-        v5?.['refill_percentage_points_per_day'] != null ? h('span', null, `${Number(v5['refill_percentage_points_per_day']).toFixed(1)} 个百分点`) : null,
-        h('span', { className: 'k' }, '订阅到期'), h('span', null, dateTimeLabel(credits['expires_at'])))) : null)
+      credits === null ? h('div', { className: 'nai-empty' }, creditsBusy ? '正在查询额度' : '暂无额度数据')
+        : ((credits['endpoints'] as Rec[] | undefined) ?? []).length === 0
+          ? h('div', { className: 'nai-kv' },
+            h('span', { className: 'k' }, '总余额'), h('strong', null, totalAnlas == null ? '—' : `${totalAnlas} Anlas`))
+          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+            ((credits['endpoints'] as Rec[])).map((row) => {
+              const id = String(row['id'])
+              const detail = (row['credits'] ?? {}) as Rec
+              const anlasRow = detail['anlas'] as Rec | undefined
+              const usage = detail['v5_usage_summary'] as Rec | undefined
+              const allowance = row['allowance'] as Rec | null | undefined
+              const official = row['official'] === true
+              const share = Number(row['v5_share'] ?? 1)
+              return h('div', { key: id, style: { border: '1px solid var(--nai-border, #2a2a35)', borderRadius: 8, padding: 10 } },
+                h('div', { className: 'nai-row', style: { gap: 8, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' } },
+                  h('strong', null, String(row['name'])),
+                  row['active'] ? h('span', { className: 'nai-pill ok' }, '默认') : null,
+                  h('span', { className: 'nai-pill' }, official ? '官方' : '非官方'),
+                  h('span', { style: { flex: 1 } }),
+                  h('span', { style: { fontSize: 11, color: 'var(--nai-faint)' } }, String(row['base_url'] ?? ''))),
+                row['ok'] !== true
+                  ? ErrorBox({ error: String(row['error'] ?? '查询失败') })
+                  : h('div', { className: 'nai-kv' },
+                    h('span', { className: 'k' }, 'Anlas 余额'), h('strong', null, anlasRow?.['total'] == null ? '—' : String(anlasRow['total'])),
+                    h('span', { className: 'k' }, '订阅'), h('span', null, official
+                      ? (detail['active'] === true ? 'Opus · 生效中' : `Tier ${String(detail['tier'] ?? '—')} · 未生效`)
+                      : (String(row['subscription_note'] ?? '') || '未填写（该接口不报告订阅）')),
+                    h('span', { className: 'k' }, '到期'), h('span', null, official
+                      ? (Number(detail['expires_at'] ?? 0) > 0 ? dateTimeLabel(Number(detail['expires_at'])) : '—')
+                      : (String(row['subscription_expires'] ?? '') || '—')),
+                    usage ? h('span', { className: 'k' }, 'V5 余量') : null,
+                    usage ? h('span', null, `${String(usage['remaining_percent'] ?? '-')}%`) : null,
+                    !usage && share > 1 ? h('span', { className: 'k' }, 'V5 份额') : null,
+                    !usage && share > 1 ? h('span', null, `1/${share}（满池约 ${Math.round(1730 / share)} 张 832×1216）`) : null,
+                    allowance?.ok ? h('span', { className: 'k' }, '站点 V5 余量') : null,
+                    allowance?.ok ? h('span', null, `${String(allowance['percent'] ?? '-')}%（${String(allowance['available_images'] ?? '-')} / ${String(allowance['capacity_images'] ?? '-')} 张${allowance['share_count'] ? `，${String(allowance['share_count'])} 人拼车` : ''}）`) : null,
+                    allowance && allowance['ok'] !== true ? h('span', { className: 'k' }, '站点额度') : null,
+                    allowance && allowance['ok'] !== true ? h('span', null, String(allowance['note'] ?? '未配置站点令牌')) : null,
+                    !allowance && String(row['quota_kind'] ?? 'none') !== 'none' ? h('span', { className: 'k' }, '站点额度') : null,
+                    !allowance && String(row['quota_kind'] ?? 'none') !== 'none' ? h('span', null, '未配置站点登录令牌') : null,
+                  ))
+            }))) : null)
 }

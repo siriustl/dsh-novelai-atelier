@@ -28,7 +28,7 @@ describe('DSH runtime integration', () => {
     const ctx: any = { provide: (key: string, value: unknown) => { services[key] = value; return vi.fn() }, tools: services.tools, get: (key: string) => services[key], logger: () => ({ warn: vi.fn(), info: vi.fn() }), effect: (fn: () => () => void) => { disposers.push(fn()); return vi.fn() } }
     ctx.inject = (deps: string[], callback: (context: any) => unknown) => { if (deps.every((key) => services[key])) callback(ctx) }
     apply(ctx, { token: '', outputDirectory: '', proxyUrl: 'http://127.0.0.1:8888', apiPrefix: '/custom/nai/', startWorker: false })
-    expect(tools.length).toBe(15)
+    expect(tools.length).toBe(16)
     expect(route.path).toBe('/custom/nai')
     expect(tap('<head></head>')).toContain('window.__NAI_ATELIER_API_PREFIX__="/custom/nai"')
     expect(new Workbench(root).settings.raw()['proxy_url']).toBe('http://127.0.0.1:8888')

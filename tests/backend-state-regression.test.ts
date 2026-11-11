@@ -156,9 +156,12 @@ describe('credential-free portable receipt files', () => {
     expect(JSON.stringify(portableReceipt)).not.toContain(token)
     expect(portableReceipt.request.image_path).toMatch(/^@file\/files\//)
     for (const [name, bytes] of Object.entries(files)) {
-      expect(strFromU8(bytes)).not.toContain(token)
+      // Endpoint tokens travel in the settings row by design; receipts and assets must not.
+      if (name !== 'workbench.json') expect(strFromU8(bytes)).not.toContain(token)
       if (name.startsWith('files/')) expect(name.slice(6, name.lastIndexOf('.'))).toBe(createHash('sha256').update(bytes).digest('hex'))
     }
+    const exportedSettings = JSON.parse(manifest.tables.kv.find((row: Rec) => row.key === 'settings').value)
+    expect(exportedSettings.nai_endpoints[0].token).toBe(token)
     new Backup(restored).restore(exported.path)
     const job = restored.store.listJobs()[0]!
     const localReceiptPath = (job.result as any).record_path
@@ -168,6 +171,6 @@ describe('credential-free portable receipt files', () => {
     expect(existsSync(localReceipt.request.image_path)).toBe(true)
     expect(JSON.stringify(localReceipt)).not.toContain(original.root)
     expect(basename(localReceiptPath, '.json')).toBe(createHash('sha256').update(localBytes).digest('hex'))
-    expect(restored.settings.public().token_configured).toBe(false)
+    expect(restored.settings.public().token_configured).toBe(true)
   })
 })

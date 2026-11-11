@@ -15,6 +15,64 @@ export function checkUrl(value: string, optional = false): string {
   return trimmed
 }
 
+/** Site session endpoint used to read the V5 allowance the NAI-shaped API hides. */
+export const HUAMIO_QUOTA_URL = 'https://api.novelai.me/api/v1/novelai/v5-energy-policy'
+
+export type QuotaKind = 'none' | 'huamio' | 'custom'
+
+export interface EndpointRecord {
+  id: string
+  name: string
+  base_url: string
+  token: string
+  enabled: boolean
+  /** 拼车人数 N：该接口的 V5 额度按官方满池的 1/N 估算。 */
+  v5_share: number
+  assume_opus: boolean
+  quota_kind: QuotaKind
+  quota_url: string
+  quota_token: string
+  /** Free-text subscription note; the NAI-shaped API never reports one for relays. */
+  subscription_note: string
+  /** Optional ISO date (YYYY-MM-DD) typed by the user. */
+  subscription_expires: string
+}
+
+export interface EndpointTarget {
+  id: string
+  name: string
+  baseUrl: string
+  token: string
+  v5Share: number
+  official: boolean
+  freeMode: 'official' | 'opus' | 'none'
+}
+
+/** The official image host is the only endpoint whose Opus/free rules this client can verify. */
+export function isOfficialBaseUrl(value: string): boolean {
+  try { return /(^|\.)novelai\.net$/u.test(new URL(value).hostname) } catch { return false }
+}
+
+export function freeModeOf(endpoint: { base_url: string; assume_opus?: boolean }): 'official' | 'opus' | 'none' {
+  if (isOfficialBaseUrl(endpoint.base_url)) return 'official'
+  return endpoint.assume_opus === true ? 'opus' : 'none'
+}
+
+/** Carpool size N; 1 means the whole official pool. Legacy `v5_rate` was a price multiplier. */
+export function v5ShareOf(endpoint: { v5_share?: unknown; v5_rate?: unknown }): number {
+  const value = Number(endpoint.v5_share ?? endpoint.v5_rate ?? 1)
+  if (!Number.isFinite(value) || value < 1) return 1
+  return Math.min(64, Math.round(value))
+}
+
+export function quotaKindOf(endpoint: { quota_kind?: unknown; quota_url?: string }): QuotaKind {
+  const kind = endpoint.quota_kind
+  if (kind === 'huamio' || kind === 'custom' || kind === 'none') return kind
+  return endpoint.quota_url ? 'custom' : 'none'
+}
+
+const ENDPOINT_ID = /^[a-z0-9_-]{1,32}$/u
+
 export class Settings {
   readonly secretsDir: string
 
@@ -93,6 +151,8 @@ export class Settings {
     const values = this.store.getSettings()
     const defaults: Rec = {
       nai_base_url: 'https://image.novelai.net',
+      nai_endpoints: [],
+      nai_active_endpoint: '',
       proxy_url: process.env['HTTPS_PROXY'] ?? '',
       output_directory: defaultOutputDir(),
       creative_preferences: '',
@@ -106,23 +166,100 @@ export class Settings {
     return merged
   }
 
+  /**
+   * Endpoint records. Older installs stored one base URL plus an encrypted
+   * token reference; that pair is migrated to a single endpoint once and kept
+   * in plaintext so it can be listed and edited.
+   */
+  private endpointsOf(raw: Rec): EndpointRecord[] {
+    const stored = raw['nai_endpoints']
+    if (Array.isArray(stored) && stored.length > 0) return stored as EndpointRecord[]
+    const baseUrl = String(raw['nai_base_url'] || 'https://image.novelai.net')
+    let token = ''
+    try { token = raw['nai_secret'] ? this.secret(raw['nai_secret'] as string) : this.fallbackToken() } catch { token = '' }
+    const migrated: EndpointRecord[] = [{
+      id: 'default', name: isOfficialBaseUrl(baseUrl) ? '官方 NovelAI' : '接口 1',
+      base_url: baseUrl, token, enabled: true, v5_share: 1, assume_opus: false,
+      quota_kind: 'none', quota_url: '', quota_token: '', subscription_note: '', subscription_expires: '',
+    }]
+    raw['nai_endpoints'] = migrated
+    raw['nai_active_endpoint'] = 'default'
+    return migrated
+  }
+
+  /** Public endpoint list; tokens are never returned, only hints. */
+  endpoints(): Rec[] {
+    const raw = this.raw()
+    const list = this.endpointsOf(raw)
+    const activeId = this.activeIdOf(raw, list)
+    return list.map((item, index) => ({
+      id: item.id, name: item.name, base_url: item.base_url, enabled: item.enabled,
+      priority: index, active: item.id === activeId, official: isOfficialBaseUrl(item.base_url),
+      v5_share: v5ShareOf(item), assume_opus: item.assume_opus === true,
+      free_mode: freeModeOf(item),
+      token_configured: item.token.length > 0, token_hint: tokenHint(item.token),
+      quota_kind: quotaKindOf(item), quota_url: item.quota_url, quota_configured: item.quota_token.length > 0,
+      subscription_note: item.subscription_note ?? '', subscription_expires: item.subscription_expires ?? '',
+    }))
+  }
+
+  private activeIdOf(raw: Rec, list: EndpointRecord[]): string {
+    const requested = String(raw['nai_active_endpoint'] || '')
+    const chosen = list.find((item) => item.id === requested && item.enabled)
+    return (chosen ?? list.find((item) => item.enabled))?.id ?? ''
+  }
+
+  /** Connection target for generation; `endpointId` overrides the configured default. */
+  target(endpointId?: string): EndpointTarget {
+    const raw = this.raw()
+    const list = this.endpointsOf(raw)
+    const chosen = endpointId ? list.find((item) => item.id === endpointId) : list.find((item) => item.id === this.activeIdOf(raw, list))
+    if (!chosen) throw new Error(endpointId ? '指定的接口不存在' : '尚未配置可用的 NovelAI 接口')
+    if (!chosen.token) throw new Error(`接口「${chosen.name}」缺少令牌`)
+    return {
+      id: chosen.id, name: chosen.name, baseUrl: chosen.base_url, token: chosen.token,
+      v5Share: v5ShareOf(chosen), official: isOfficialBaseUrl(chosen.base_url), freeMode: freeModeOf(chosen),
+    }
+  }
+
+  endpointToken(endpointId: string): string {
+    const found = this.endpointsOf(this.raw()).find((item) => item.id === endpointId)
+    return found?.token ?? ''
+  }
+
+  /** Optional site session used to read an allowance the API key cannot see. */
+  quotaTarget(endpointId?: string): { url: string; token: string } | null {
+    const raw = this.raw()
+    const list = this.endpointsOf(raw)
+    const chosen = endpointId ? list.find((item) => item.id === endpointId) : list.find((item) => item.id === this.activeIdOf(raw, list))
+    if (!chosen?.quota_url || !chosen.quota_token) return null
+    return { url: chosen.quota_url, token: chosen.quota_token }
+  }
+
   naiToken(): string {
-    const reference = this.raw()['nai_secret']
-    return reference ? this.secret(reference as string) : this.fallbackToken()
+    const list = this.endpointsOf(this.raw())
+    const chosen = list.find((item) => item.enabled)
+    return chosen?.token ?? this.fallbackToken()
   }
 
   public(): Rec {
     const raw = this.raw()
-    let configured = false
-    try { configured = Boolean(this.naiToken()) } catch { configured = false }
+    const endpoints = this.endpoints()
+    const configured = endpoints.some((item) => item['token_configured'] === true)
     const ai = raw['ai'] as Rec
+    const active = endpoints.find((item) => item['active'] === true)
     return {
-      nai_base_url: raw['nai_base_url'], proxy_url: raw['proxy_url'],
+      nai_base_url: active?.['base_url'] ?? raw['nai_base_url'],
+      nai_endpoints: endpoints, nai_active_endpoint: active?.['id'] ?? '',
+      // Generation uses the active endpoint, so this is the flag the run button must honor.
+      active_token_configured: active?.['token_configured'] === true,
+      active_endpoint_name: active?.['name'] ?? '',
+      proxy_url: raw['proxy_url'],
       creative_preferences: raw['creative_preferences'], onboarding_complete: raw['onboarding_complete'],
       retry_delay_seconds: raw['retry_delay_seconds'], retry_max_attempts: raw['retry_max_attempts'],
       ai_profiles: this.profiles(),
       output_directory: raw['output_directory'], token_configured: configured,
-      token_source: raw['nai_secret'] ? '工作台加密保存' : configured ? '插件配置' : '未配置',
+      token_source: configured ? '工作台明文保存' : this.fallbackToken() ? '插件配置' : '未配置',
       ai: {
         dsh_provider: ai['dsh_provider'] ?? '',
         dsh_model: ai['dsh_model'] ?? '',
@@ -134,7 +271,7 @@ export class Settings {
   save(values: Rec): Rec {
     if (!(values instanceof Object) || Array.isArray(values)) throw new Error('设置必须是对象')
     const raw = this.raw()
-    const allowed = new Set(['nai_base_url', 'proxy_url', 'output_directory', 'nai_token', 'ai', 'token_configured', 'token_source', 'creative_preferences', 'onboarding_complete', 'retry_delay_seconds', 'retry_max_attempts'])
+    const allowed = new Set(['nai_base_url', 'nai_endpoints', 'nai_active_endpoint', 'proxy_url', 'output_directory', 'nai_token', 'ai', 'token_configured', 'token_source', 'creative_preferences', 'onboarding_complete', 'retry_delay_seconds', 'retry_max_attempts'])
     for (const key of Object.keys(values)) {
       if (!allowed.has(key)) throw new Error('包含未知设置字段')
     }
@@ -155,9 +292,7 @@ export class Settings {
       if (typeof values['onboarding_complete'] !== 'boolean') throw new Error('引导状态无效')
       raw['onboarding_complete'] = values['onboarding_complete']
     }
-    for (const key of ['nai_base_url', 'proxy_url'] as const) {
-      if (key in values) raw[key] = checkUrl(String(values[key]), key === 'proxy_url')
-    }
+    if ('proxy_url' in values) raw['proxy_url'] = checkUrl(String(values['proxy_url']), true)
     if ('output_directory' in values) {
       const text = String(values['output_directory']).trim()
       if (!text || text.includes('\0')) throw new Error('请选择有效的图片保存目录')
@@ -166,10 +301,34 @@ export class Settings {
       mkdirSync(path, { recursive: true })
       raw['output_directory'] = path
     }
-    const token = String(values['nai_token'] ?? '').trim()
-    if (token) {
-      if (!token.startsWith('pst-') || /\s/u.test(token)) throw new Error('NovelAI token 应以 pst- 开头且不含空白')
-      raw['nai_secret'] = this.seal(token, true)
+    // Legacy single-endpoint fields keep working: they update (or create) one endpoint.
+    if ('nai_base_url' in values) raw['nai_base_url'] = checkUrl(String(values['nai_base_url']))
+    if ('nai_token' in values) {
+      const token = checkToken(String(values['nai_token'] ?? ''))
+      if (token) {
+        const list = this.endpointsOf(raw)
+        const active = list.find((item) => item.id === this.activeIdOf(raw, list))
+        if (active) active.token = token
+        else list.push({ id: 'default', name: '接口 1', base_url: String(raw['nai_base_url']), token, enabled: true, v5_share: 1, assume_opus: false, quota_kind: 'none', quota_url: '', quota_token: '', subscription_note: '', subscription_expires: '' })
+      }
+    }
+    if ('nai_base_url' in values) {
+      const list = this.endpointsOf(raw)
+      const active = list.find((item) => item.id === this.activeIdOf(raw, list))
+      if (active && active.base_url !== raw['nai_base_url']) active.base_url = String(raw['nai_base_url'])
+    }
+    if ('nai_endpoints' in values) raw['nai_endpoints'] = this.parseEndpoints(values['nai_endpoints'], this.endpointsOf(raw))
+    if ('nai_active_endpoint' in values) {
+      const wanted = String(values['nai_active_endpoint'] ?? '')
+      const list = raw['nai_endpoints'] as EndpointRecord[]
+      if (wanted && !list.some((item) => item.id === wanted)) throw new Error('选择的默认接口不存在')
+      raw['nai_active_endpoint'] = wanted
+    }
+    if ('nai_endpoints' in values || 'nai_active_endpoint' in values) {
+      // A deleted or disabled default must not leave a dangling id behind.
+      const list = raw['nai_endpoints'] as EndpointRecord[]
+      const wanted = String(raw['nai_active_endpoint'] || '')
+      if (wanted && !list.some((item) => item.id === wanted && item.enabled)) raw['nai_active_endpoint'] = list.find((item) => item.enabled)?.id ?? ''
     }
     if ('ai' in values) {
       const updated = { ...(raw['ai'] as Rec) }
@@ -178,6 +337,60 @@ export class Settings {
     }
     this.store.saveSettings(raw)
     return this.public()
+  }
+
+  /** Validate a replacement endpoint list; omitted tokens keep the stored value. */
+  private parseEndpoints(input: unknown, previous: EndpointRecord[]): EndpointRecord[] {
+    if (!Array.isArray(input)) throw new Error('接口列表必须是数组')
+    if (input.length > 20) throw new Error('最多保存 20 个接口')
+    const seen = new Set<string>()
+    return input.map((item, index) => {
+      if (!(item instanceof Object) || Array.isArray(item)) throw new Error(`第 ${index + 1} 个接口格式无效`)
+      const entry = item as Rec
+      const before = previous.find((candidate) => candidate.id === entry['id'])
+      const rawId = String(entry['id'] ?? '')
+      const id = rawId
+        ? (ENDPOINT_ID.test(rawId) ? rawId : (() => { throw new Error('接口 ID 无效') })())
+        : (before?.id ?? `ep_${randomHex().slice(0, 8)}`)
+      if (seen.has(id)) throw new Error('接口 ID 重复')
+      seen.add(id)
+      const name = String(entry['name'] ?? before?.name ?? `接口 ${index + 1}`).trim()
+      if (!name || name.length > 60) throw new Error('接口名称需要 1–60 字')
+      const baseUrl = checkUrl(String(entry['base_url'] ?? before?.base_url ?? ''))
+      let token = before?.token ?? ''
+      if ('token' in entry) {
+        const supplied = checkToken(String(entry['token'] ?? ''))
+        if (supplied) token = supplied
+      }
+      const enabled = typeof entry['enabled'] === 'boolean' ? entry['enabled'] : before?.enabled ?? true
+      const share = Number(entry['v5_share'] ?? entry['v5_rate'] ?? before?.v5_share ?? 1)
+      if (!Number.isFinite(share) || share < 1 || share > 64) throw new Error('拼车人数需要 1–64 的数字')
+      const assumeOpus = typeof entry['assume_opus'] === 'boolean' ? entry['assume_opus'] : before?.assume_opus ?? false
+      const quotaKind = (entry['quota_kind'] ?? before?.quota_kind ?? 'none') as QuotaKind
+      if (quotaKind !== 'none' && quotaKind !== 'huamio' && quotaKind !== 'custom') throw new Error('站点额度查询类型无效')
+      const quotaUrl = quotaKind === 'none' ? ''
+        : quotaKind === 'huamio' ? HUAMIO_QUOTA_URL
+          // A leftover preset URL must not satisfy "custom" by accident.
+          : checkUrl(String(entry['quota_url'] ?? (quotaKindOf(before ?? {}) === 'custom' ? before?.quota_url ?? '' : '')))
+      let quotaToken = before?.quota_token ?? ''
+      if ('quota_token' in entry) {
+        const supplied = String(entry['quota_token'] ?? '').trim().replace(/^Bearer\s+/iu, '')
+        if (supplied) {
+          if (/\s/u.test(supplied) || supplied.length > 4096) throw new Error('站点令牌格式无效；请粘贴 Bearer 后面那一段')
+          quotaToken = supplied
+        }
+      }
+      const note = String(entry['subscription_note'] ?? before?.subscription_note ?? '').trim()
+      if (note.length > 200) throw new Error('订阅说明不超过 200 字')
+      const expires = String(entry['subscription_expires'] ?? before?.subscription_expires ?? '').trim()
+      if (expires && !/^\d{4}-\d{2}-\d{2}$/u.test(expires)) throw new Error('订阅到期日使用 YYYY-MM-DD')
+      if (expires && Number.isNaN(Date.parse(expires))) throw new Error('订阅到期日无效')
+      return {
+        id, name, base_url: baseUrl, token, enabled, v5_share: Math.round(share), assume_opus: assumeOpus,
+        quota_kind: quotaKind, quota_url: quotaUrl, quota_token: quotaToken,
+        subscription_note: note, subscription_expires: expires,
+      }
+    })
   }
 
   /** Validate and merge AI settings into a target object (without persisting). */
@@ -200,9 +413,12 @@ export class Settings {
 
   freeze(): Rec {
     const raw = this.raw()
+    let target: EndpointTarget | null = null
+    try { target = this.target() } catch { target = null }
     return {
-      nai_base_url: raw['nai_base_url'], proxy_url: raw['proxy_url'],
-      output_directory: raw['output_directory'], nai_secret: this.seal(this.naiToken()),
+      ...(target ? { endpoint_id: target.id } : {}),
+      nai_base_url: target?.baseUrl ?? String(raw['nai_base_url']), proxy_url: raw['proxy_url'],
+      output_directory: raw['output_directory'],
       retry_delay_seconds: raw['retry_delay_seconds'], retry_max_attempts: raw['retry_max_attempts'],
     }
   }
@@ -289,6 +505,19 @@ export class Settings {
 
 function randomHex(): string {
   return Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16))).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** API keys are not all `pst-` prefixed; keep them single-line and non-empty. */
+function checkToken(value: string): string {
+  const token = value.trim()
+  if (!token) return ''
+  if (/\s/u.test(token) || token.length < 8 || token.length > 4096) throw new Error('令牌不能包含空白，长度需要在 8–4096 之间')
+  return token
+}
+
+function tokenHint(token: string): string {
+  if (!token) return ''
+  return token.length <= 10 ? `${token.slice(0, 3)}…` : `…${token.slice(-6)}`
 }
 
 function store_listConversationsUsesProfile(store: Store, ident: string): boolean {

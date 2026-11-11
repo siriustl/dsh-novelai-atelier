@@ -165,34 +165,64 @@ describe('keyboard and error recovery', () => {
     handler({ key: ' ', target: {}, currentTarget: target, preventDefault: vi.fn() })
     expect(action).toHaveBeenCalledOnce()
   })
-  it('retains a failed credential save for retry and clears it only on success', async () => {
+  const endpointFixture = () => ({ id: 'default', name: '官方 NovelAI', base_url: 'https://image.novelai.net', enabled: true, priority: 0, active: true, official: true, v5_rate: 1, assume_opus: false, free_mode: 'official', token_configured: false, token_hint: '', quota_url: '', quota_configured: false })
+  const openEndpointEditor = (ui: ReturnType<typeof harness>, current: WorkbenchState): Rec => {
+    let tree = ui.render(SettingsPanel, { state: current })
+    button(tree, '编辑').props.onClick()
+    tree = ui.render(SettingsPanel, { state: current })
+    return tree
+  }
+  const endpointTokenInput = (tree: Rec): Rec => nodes(tree).find((node) => node.type === 'input' && node.props?.type === 'password')!
+
+  it('retains a failed endpoint save for retry and keeps the typed token', async () => {
     const current = state()
-    current.settings = { token_configured: false, ai: {} }
-    vi.mocked(api).mockRejectedValueOnce(new Error('Network unavailable')).mockResolvedValueOnce({})
+    current.settings = { ai: {}, nai_endpoints: [endpointFixture()] }
+    vi.mocked(api).mockRejectedValueOnce(new Error('Network unavailable'))
     const ui = harness()
-    const tree = ui.render(SettingsPanel, { state: current })
-    const input = { value: 'pst-secret' }
-    nodes(tree).find((n) => n.type === 'input' && n.props?.type === 'password')!.props.ref(input)
-    button(tree, '\u4fdd\u5b58\u4ee4\u724c').props.onClick(); await settle()
-    expect(input.value).toBe('pst-secret')
-    expect(nodes(ui.render(SettingsPanel, { state: current })).some((n) => n.props?.role === 'alert' && text(n).includes('Network unavailable'))).toBe(true)
-    button(tree, '\u4fdd\u5b58\u4ee4\u724c').props.onClick(); await settle()
-    expect(input.value).toBe('')
+    let tree = openEndpointEditor(ui, current)
+    endpointTokenInput(tree).props.onInput({ target: { value: 'pst-secret-token' } })
+    tree = ui.render(SettingsPanel, { state: current })
+    button(tree, '保存接口').props.onClick(); await settle()
+    tree = ui.render(SettingsPanel, { state: current })
+    expect(nodes(tree).some((node) => node.props?.role === 'alert' && text(node).includes('Network unavailable'))).toBe(true)
+    expect(endpointTokenInput(tree).props.value).toBe('pst-secret-token')
   })
-  it('does not clear a replacement typed while the earlier credential save is pending', async () => {
+  it('keeps a replacement typed while the earlier endpoint save is pending', async () => {
     const current = state()
-    current.settings = { token_configured: false, ai: {} }
+    current.settings = { ai: {}, nai_endpoints: [endpointFixture()] }
     const pending = deferred<Rec>()
     vi.mocked(api).mockReturnValueOnce(pending.promise)
     const ui = harness()
-    const tree = ui.render(SettingsPanel, { state: current })
-    const input = { value: 'pst-first' }
-    nodes(tree).find((n) => n.type === 'input' && n.props?.type === 'password')!.props.ref(input)
-    button(tree, '\u4fdd\u5b58\u4ee4\u724c').props.onClick()
-    input.value = 'pst-next'
+    let tree = openEndpointEditor(ui, current)
+    endpointTokenInput(tree).props.onInput({ target: { value: 'pst-first-token' } })
+    tree = ui.render(SettingsPanel, { state: current })
+    button(tree, '保存接口').props.onClick()
+    endpointTokenInput(tree).props.onInput({ target: { value: 'pst-next-token' } })
+    tree = ui.render(SettingsPanel, { state: current })
+    expect(endpointTokenInput(tree).props.value).toBe('pst-next-token')
     pending.resolve({}); await settle()
-    expect(input.value).toBe('pst-next')
-    expect(api).toHaveBeenCalledWith('/settings', 'PUT', { nai_token: 'pst-first' })
+    const sent = vi.mocked(api).mock.calls[0]![2] as Rec
+    expect((sent['nai_endpoints'] as Rec[])[0]!['token']).toBe('pst-first-token')
+  })
+  it('serializes blur saves while queueing an endpoint save made during autosave', async () => {
+    const current = state()
+    current.settings = { ai: {}, output_directory: 'C:/old', retry_delay_seconds: 3, retry_max_attempts: 3, nai_endpoints: [endpointFixture()] }
+    const first = deferred<Rec>()
+    vi.mocked(api).mockReturnValueOnce(first.promise as any).mockResolvedValue({} as any)
+    const ui = harness()
+    let tree = ui.render(SettingsPanel, { state: current })
+    nodes(tree).find((node) => node.type === 'input' && node.props?.defaultValue === 'C:/old')!.props.onBlur({ target: { value: 'C:/new' } })
+    tree = openEndpointEditor(ui, current)
+    endpointTokenInput(tree).props.onInput({ target: { value: 'pst-queued-save' } })
+    tree = ui.render(SettingsPanel, { state: current })
+    button(tree, '保存接口').props.onClick()
+    await settle()
+    expect(api).toHaveBeenCalledTimes(1)
+    first.resolve({}); await settle()
+    const payloads = vi.mocked(api).mock.calls.map((call) => call[2])
+    expect(payloads[0]).toEqual({ output_directory: 'C:/new' })
+    expect(payloads[1]).toMatchObject({ nai_endpoints: expect.any(Array) })
+    expect((payloads[1]!['nai_endpoints'] as Rec[])[0]!['token']).toBe('pst-queued-save')
   })
   it('exports backups through the shared download lifecycle', async () => {
     const current = state()
@@ -205,26 +235,16 @@ describe('keyboard and error recovery', () => {
     await settle()
     expect(saveBlob).toHaveBeenCalledWith(blob, 'snapshot.zip')
   })
-  it('serializes blur saves while preserving a token click made during autosave', async () => {
+  it('does not delete an endpoint when the confirmation is declined', async () => {
     const current = state()
-    current.settings = { ai: {}, output_directory: 'C:/old', retry_delay_seconds: 3, retry_max_attempts: 3 }
-    const first = deferred<Rec>()
-    vi.mocked(api).mockReturnValueOnce(first.promise as any).mockResolvedValue({} as any)
+    current.settings = { ai: {}, nai_endpoints: [endpointFixture(), { ...endpointFixture(), id: 'ep_second', name: '第二个' }] }
+    vi.stubGlobal('confirm', () => false)
     const ui = harness()
-    let tree = ui.render(SettingsPanel, { state: current })
-    nodes(tree).find((node) => node.type === 'input' && node.props?.defaultValue === 'C:/old')!.props.onBlur({ target: { value: 'C:/new' } })
-    tree = ui.render(SettingsPanel, { state: current })
-    const token = { value: 'pst-queued-save' }
-    nodes(tree).find((node) => node.type === 'input' && node.props?.type === 'password')!.props.ref(token)
-    expect(button(tree, '保存令牌').props.disabled).toBe(false)
-    button(tree, '保存令牌').props.onClick()
-    nodes(tree).find((node) => node.type === 'input' && node.props?.max === 60)!.props.onBlur({ target: { value: '5' } })
+    const deletes = nodes(ui.render(SettingsPanel, { state: current })).filter((node) => node.type === 'button' && text(node) === '删除')
+    expect(deletes).toHaveLength(2)
+    deletes[0]!.props.onClick()
     await settle()
-    expect(api).toHaveBeenCalledTimes(1)
-    first.resolve({}); await settle()
-    expect(vi.mocked(api).mock.calls.map((call) => call[2])).toEqual([{ output_directory: 'C:/new' }, { nai_token: 'pst-queued-save' }, { retry_delay_seconds: 5 }])
-    expect(token.value).toBe('')
-    expect(nodes(tree).find((node) => node.type === 'input' && node.props?.max === 10)!.props.onChange).toBeUndefined()
+    expect(api).not.toHaveBeenCalled()
   })
   it('uses the host-injected API prefix rather than a hardcoded route', async () => {
     vi.stubGlobal('__NAI_ATELIER_API_PREFIX__', '/custom/atelier/')
@@ -239,15 +259,20 @@ describe('library search ordering and encoded Vibe flows', () => {
   it.each(['resolve', 'reject'])('ignores a stale library response that later %ss', async (outcome) => {
     const old = deferred<Rec[]>()
     const newest = { id: 'new', revision: 0, kind: 'character', name: 'Newest entry', data: {} }
+    const row = { ...newest, prompt_preview: '', tags: [], favorite: false, prompt_set_count: 0, example_count: 0, cover_asset_id: null, branches: [] }
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === '/library') return [] as any
-      if (path.endsWith('query=')) return old.promise as any
+      if (String(path).startsWith('/library/query')) {
+        return (path.includes('query=new') ? { items: [row], total: 1, next_offset: null, facets: { all: 1, kinds: { character: 1 }, favorites: 0, tags: [] } } : old.promise) as any
+      }
       return [newest] as any
     })
     const current = state()
     const ui = harness()
     let tree = ui.render(LibraryPanel, { state: current }); ui.effects()
     nodes(tree).find((n) => n.type === 'input' && n.props?.placeholder)!.props.onChange({ target: { value: 'new' } })
+    ui.render(LibraryPanel, { state: current }); ui.effects()
+    vi.advanceTimersByTime(300)
     tree = ui.render(LibraryPanel, { state: current }); ui.effects(); await settle()
     expect(text(ui.render(LibraryPanel, { state: current }))).toContain('Newest entry')
     if (outcome === 'resolve') old.resolve([{ id: 'old', kind: 'character', name: 'Obsolete entry', data: {} }])
@@ -451,7 +476,10 @@ describe('serialized optimistic draft saves', () => {
 describe('frontend route and revision flows', () => {
   it('applies composed library prompts with a revision and uses the real delete route', async () => {
     const entry = { id: 'branch', revision: 2, kind: 'branch', name: 'Branch', data: { prompt: 'clothes' } }
-    vi.mocked(api).mockImplementation(async (path) => path === '/library/preview' ? { prompt: 'identity, clothes', negative_prompt: 'wrong identity' } as any : path.startsWith('/library?') || path === '/library' ? [entry] as any : {} as any)
+    const row = { ...entry, prompt_preview: 'clothes', parent_name: null, tags: [], favorite: false, prompt_set_count: 0, example_count: 0, cover_asset_id: null, branches: [] }
+    vi.mocked(api).mockImplementation(async (path) => path === '/library/preview' ? { prompt: 'identity, clothes', negative_prompt: 'wrong identity' } as any
+      : String(path).startsWith('/library/query') ? { items: [row], total: 1, next_offset: null, facets: { all: 1, kinds: { branch: 1 }, favorites: 0, tags: [] } } as any
+        : path === '/library' ? [entry] as any : {} as any)
     const current = state()
     const ui = harness()
     ui.render(LibraryPanel, { state: current }); ui.effects(); await settle()
@@ -746,6 +774,43 @@ describe('workbench refinement regressions', () => {
     const editor = nodes(tree).find((node) => typeof node.type === 'function' && node.type.name === 'MaskEditor')!
     editor.props.onSaved('/opaque-black-white.png'); await vi.advanceTimersByTimeAsync(250)
     expect(current.patchDraft).toHaveBeenCalledWith(expect.objectContaining({ request: expect.objectContaining({ mask_path: '/opaque-black-white.png', mask_mode: 'luminance' }) }), 7)
+  })
+
+  it.each(['nai-diffusion-4-5-full', 'nai-diffusion-5-curated'])('clears Medium when changing to %s', async (model) => {
+    const current = state(); current.draft!.request = { ...current.draft!.request, v5_tier: 'medium' }
+    const ui = harness()
+    const tree = ui.render(WorkspacePanel, { state: current })
+    const select = nodes(tree).find(n => n.type === 'select' && n.props.value === 'nai-diffusion-5-full')!
+    select.props.onChange({ target: { value: model } })
+    await vi.advanceTimersByTimeAsync(250)
+    expect(current.patchDraft).toHaveBeenCalledWith(expect.objectContaining({ request: expect.objectContaining({ model, v5_tier: 'high' }) }), 7)
+    expect(text(ui.render(WorkspacePanel, { state: current }))).not.toContain('V5 档位')
+  })
+
+  it('drops stale target dimensions when switching to outpaint', async () => {
+    const current = state(); current.draft!.request = { ...current.draft!.request, width: 832, height: 1216, focus_box: [0, 0, 64, 64], mask_path: '/old-mask.png' }
+    const ui = harness()
+    button(ui.render(WorkspacePanel, { state: current }), '扩图 (Outpaint)').props.onClick()
+    await vi.advanceTimersByTimeAsync(250)
+    const request = (vi.mocked(current.patchDraft).mock.calls.at(-1)![0] as Rec).request
+    for (const field of ['width', 'height', 'focus_box', 'mask_path']) expect(request).not.toHaveProperty(field)
+  })
+
+  it.each(['generate', 'upscale', 'augment', 'encode_vibe'])('exposes explicit task categories for %s', (operation) => {
+    const current = state(); current.draft!.operation = operation
+    const ui = harness()
+    expect(text(ui.render(WorkspacePanel, { state: current }))).toContain('本任务分类目录（可选）')
+  })
+
+  it('flattens character tags before rendered Text in the workspace action', async () => {
+    const current = state(); current.draft!.request = { ...current.draft!.request, prompt: 'shop sign\nText: OPEN', characters: [{ prompt: 'traveler', negative_prompt: 'blur' }] }
+    const ui = harness()
+    const tree = ui.render(WorkspacePanel, { state: current })
+    const editor = nodes(tree).find(n => typeof n.type === 'function' && n.type.name === 'CharacterEditor')!
+    const child = harness()
+    button(child.render(editor.type, editor.props), '展平到主提示词').props.onClick()
+    await vi.advanceTimersByTimeAsync(250)
+    expect(current.patchDraft).toHaveBeenCalledWith(expect.objectContaining({ request: expect.objectContaining({ prompt: 'shop sign, traveler\nText: OPEN', characters: [] }) }), 7)
   })
 
   it('formats model names and seconds-based subscription expiration accurately', () => {

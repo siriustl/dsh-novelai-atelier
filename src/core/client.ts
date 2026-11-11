@@ -61,7 +61,6 @@ export function summarizeV5Usage(usage: unknown): Record<string, unknown> | null
     refill_one_percentage_point_seconds: seconds,
     refill_percentage_points_per_day: seconds && seconds > 0 ? 86400 / seconds : null,
     refill_paused_above_cap: seconds !== null ? seconds === 0 : null,
-    refill_note: 'Seconds to refill +1 percentage point from the current level, not a countdown to the next integer percent; 0 means refill is paused above the cap. Pool availability alone does not establish free generation eligibility.',
   }
 }
 
@@ -91,10 +90,51 @@ export function normalizeSubscription(data: unknown): NormalizedCredits {
 const FREE_PIXELS = 1_048_576
 const FREE_STEPS = 28
 
-export function checkFreeEligibility(r: { width: number; height: number; steps: number; isV5: boolean }, credits: NormalizedCredits): {
-  eligible: boolean; estimated_anlas: number | null; reasons: string[]; policy: string; v5_usage_condition: string | null
+/** How much of the official subscription contract applies to a configured endpoint. */
+export type FreeMode = 'official' | 'opus' | 'none'
+
+/** Allowance read from a relay's own site API, when the user configured one. */
+export interface AllowanceSummary {
+  ok?: boolean
+  percent?: number | null
+  available_images?: number | null
+  capacity_images?: number | null
+  share_count?: number | null
+}
+
+const allowanceNote = (allowance: AllowanceSummary | null | undefined): string | null => {
+  if (!allowance || allowance.ok !== true || allowance.percent == null) return null
+  const detail = [
+    allowance.available_images != null && allowance.capacity_images != null
+      ? `${allowance.available_images}/${allowance.capacity_images} images` : null,
+    allowance.share_count ? `${allowance.share_count}-way share` : null,
+  ].filter(Boolean).join(', ')
+  return `V5 allowance left: ${allowance.percent}%${detail ? ` (${detail})` : ''}`
+}
+
+export function checkFreeEligibility(r: { width: number; height: number; steps: number; isV5: boolean }, credits: NormalizedCredits, mode: FreeMode = 'official', allowance?: AllowanceSummary | null): {
+  eligible: boolean; estimated_anlas: number | null; reasons: string[]; policy: string; v5_usage_condition: string | null; mode: FreeMode
 } {
   const reasons: string[] = []
+  if (mode === 'none')
+    return {
+      eligible: false, estimated_anlas: null, reasons: ['该接口没有声明免费额度；费用按官方公式估算'],
+      policy: 'Endpoint declared no free allowance', v5_usage_condition: null, mode,
+    }
+  if (mode === 'opus') {
+    // Non-official gateways report placeholder subscription fields, so the user's
+    // declaration replaces the tier/usage checks; size and step limits still apply.
+    if (r.width * r.height > FREE_PIXELS) reasons.push('Free images must contain at most 1,048,576 pixels')
+    if (r.steps > FREE_STEPS) reasons.push('Free images must use at most 28 steps')
+    return {
+      eligible: reasons.length === 0, estimated_anlas: reasons.length === 0 ? 0 : null, reasons,
+      policy: 'Endpoint declared Opus-like free small images; server subscription state is not checked',
+      v5_usage_condition: r.isV5
+        ? allowanceNote(allowance) ?? 'V5 draws from this endpoint\'s own allowance; configure a site session token to read its remaining percentage'
+        : null,
+      mode,
+    }
+  }
   if (credits.active !== true || !numeric(credits.tier) || credits.tier < 3)
     reasons.push('A currently active Opus subscription is required')
   if (!numeric(credits.expires_at) || credits.expires_at <= Date.now() / 1000)
@@ -110,12 +150,16 @@ export function checkFreeEligibility(r: { width: number; height: number; steps: 
     if (!usage || typeof usage !== 'object' || usage.isNegative !== false)
       reasons.push('V5 needs a verified nonnegative usage state (isNegative=false); displayed 0% is eligible')
   }
+  const v5Usage = r.isV5 ? credits.v5_usage : null
   return {
     eligible: reasons.length === 0,
     estimated_anlas: reasons.length === 0 ? 0 : null,
     reasons,
     policy: 'Informational free eligibility; max_anlas is not a server-side spending cap',
-    v5_usage_condition: r.isV5 ? 'isNegative=false; no percentage headroom' : null,
+    // Only report the allowance caveat when it is the actual blocker; a failing
+    // subscription check already explains the refusal.
+    v5_usage_condition: r.isV5 && v5Usage?.isNegative === true ? 'V5 usage is negative (allowance exhausted)' : null,
+    mode,
   }
 }
 

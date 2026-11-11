@@ -1,5 +1,33 @@
 /** Draft/library prompt composition helpers. Ported from workspace_actions.py. */
-import { isV5 } from '../core/models.ts'
+import { splitPromptText } from '../core/promptText.ts'
+
+const isV5 = (model: string): boolean => model.startsWith('nai-diffusion-5-')
+
+/** Append scene tags before a rendered Text: block. */
+export function appendScenePrompt(current: string, addition: string): string {
+  const [scene, text] = splitPromptText(current)
+  const [addedScene, addedText] = splitPromptText(addition)
+  if (text !== null && addedText !== null) throw new Error('当前草稿和预设均包含 Text:，请先保留一个文字块')
+  const combined = [scene, addedScene].filter(Boolean).join(', ')
+  const rendered = text ?? addedText
+  return rendered === null ? combined : `${combined}${combined ? '\n' : ''}Text: ${rendered}`
+}
+
+/** Preset character slots survive inspiration → library → workspace round trips. */
+export function appendPresetCharacters(request: Record<string, unknown>, data: Record<string, unknown>): void {
+  if (data['characters'] === undefined) return
+  if (!Array.isArray(data['characters'])) throw new Error('预设角色需要对象列表')
+  const incoming = data['characters'] as Array<Record<string, unknown>>
+  const existing = (request['characters'] ?? []) as Array<Record<string, unknown>>
+  const limit = isV5(String(request['model'] ?? 'nai-diffusion-5-full')) ? 22 : 6
+  if (existing.length + incoming.length > limit) throw new Error(`已达到模型角色数量上限 ${limit}`)
+  for (const character of incoming) {
+    if (!character || typeof character !== 'object' || typeof character['prompt'] !== 'string' || !character['prompt'].trim())
+      throw new Error('预设角色需要有效提示词')
+  }
+  if (incoming.length) request['characters'] = [...existing, ...structuredClone(incoming)]
+}
+
 
 export function defaultDraft(): Record<string, unknown> {
   return {
@@ -42,6 +70,13 @@ export function entryPrompt(entry: Entry, entries: Entry[], promptSet = -1): { p
   return { prompt, negative }
 }
 
+/** Gallery tag filter: a character matches its first main-prompt tag, an artist its whole main prompt. */
+export function entryFilterTag(entry: Entry): string {
+  const data = (entry['data'] ?? {}) as Record<string, unknown>
+  const prompt = typeof data['prompt'] === 'string' ? data['prompt'] : ''
+  return entry['kind'] === 'character' ? (prompt.split(',')[0] ?? '').trim() : prompt.trim()
+}
+
 export function applyLibrary(draft: Record<string, unknown>, entry: Entry, entries: Entry[], opts: { prompt_set?: number; target_slot?: number | null } = {}): Record<string, unknown> {
   const result = structuredClone(draft)
   const promptSet = opts.prompt_set ?? -1
@@ -61,8 +96,9 @@ export function applyLibrary(draft: Record<string, unknown>, entry: Entry, entri
     target['negative_prompt'] = negative
     request['characters'] = characters
   } else {
-    request['prompt'] = [request['prompt'], prompt].filter(Boolean).join(', ')
+    request['prompt'] = appendScenePrompt(String(request['prompt'] ?? ''), prompt)
     request['negative_prompt'] = [request['negative_prompt'], negative].filter(Boolean).join(', ')
+    if (entry['kind'] === 'preset' && promptSet === -1) appendPresetCharacters(request, (entry['data'] ?? {}) as Entry)
   }
   const refs = ((result['library_refs'] ?? []) as Array<Record<string, unknown>>).filter((r) => slot === null || r['slot'] !== slot)
   const sets = ((entry['data'] as Record<string, unknown>)?.['prompt_sets'] ?? []) as Array<Record<string, unknown>>

@@ -6,6 +6,7 @@ import { registerTools, ToolFailure } from '../src/tools.ts'
 import { Workbench } from '../src/workbench/app.ts'
 import { NovelAIError } from '../src/core/client.ts'
 import { Raster } from '../src/core/raster.ts'
+import { encodePng } from '../src/core/png.ts'
 
 describe('registered Agent tool regression contracts', () => {
   let root: string
@@ -82,7 +83,7 @@ describe('registered Agent tool regression contracts', () => {
     expect(result.resolved_request).toMatchObject({ prompt: 'inner', model: 'nai-diffusion-4-5-full', seed: 9, max_anlas: 100 })
     expect(result.api_payload.parameters.seed).toBe(9)
     expect(result.estimated_anlas).toBeDefined()
-    expect(credits).toHaveBeenCalledWith(controller.signal)
+    expect(credits).toHaveBeenCalledWith(controller.signal, undefined)
   })
 
   it('deep merges targeted drafts and replaces arrays without mixing active draft values', async () => {
@@ -283,6 +284,12 @@ describe('registered Agent tool regression contracts', () => {
     expect(exact.entry).toEqual(character)
     expect(exact.entry.data.prompt).toBe(longPrompt)
     expect(exact.parent).toBeNull()
+    const batch = await run('nai_library_read', { ids: [character.id, branch.id] })
+    expect(batch.entries.map((item: any) => item.entry.id)).toEqual([character.id, branch.id])
+    expect(batch.entries[1].parent).toMatchObject({ id: character.id })
+    expect(batch.entries[1].composed_prompt.prompt).toContain('coat')
+    await expect(run('nai_library_read', { ids: [character.id, character.id] })).rejects.toThrow('repeat')
+    await expect(run('nai_library_read', { ids: [character.id], id: character.id })).rejects.toThrow('ids cannot')
     expect((await run('nai_library_read', { query: 'not present' })).entries).toEqual([])
     expect((await run('nai_library_read', { offset: 99 })).entries).toEqual([])
   })
@@ -432,5 +439,24 @@ describe('registered Agent tool regression contracts', () => {
   it('accepts preset aliases and returns a canonical default model', async () => {
     expect((await run('nai_get_presets', { model: 'v4.5' })).model).toBe('nai-diffusion-4-5-full')
     expect((await run('nai_get_presets')).model).toBe('nai-diffusion-5-full')
+  })
+
+  // Precise references are rasterised to 1024×1536 during both validate and pricing; that is CPU, not a hang.
+  it('prices precise references instead of dropping them from the request', { timeout: 30000 }, async () => {
+    const reference = join(root, 'reference.png')
+    writeFileSync(reference, encodePng(64, 64, new Uint8Array(64 * 64 * 4).fill(255)))
+    vi.spyOn(wb.executor, 'credits').mockResolvedValue({
+      active: true, tier: 3, expires_at: Math.floor(Date.now() / 1000) + 86400,
+      anlas: { subscription: 8782, purchased: 0, total: 8782 }, perks: {}, v5_usage: null, v5_usage_summary: null,
+    } as never)
+    const quote = await run('nai_quote', {
+      request: {
+        prompt: 'tree', width: 64, height: 64, steps: 8,
+        precise_references: [{ image_path: reference, type: 'character', strength: 0.6, fidelity: 0.5 }],
+      },
+    })
+    expect(quote.operation).toBe('reference_generate')
+    expect(quote.estimated_anlas).toBe(5)
+    expect(quote.warnings.join()).not.toContain('precise_references')
   })
 })

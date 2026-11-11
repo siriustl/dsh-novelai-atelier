@@ -1,56 +1,180 @@
 /** Character / artist / blend / preset library with prompt sets, examples, import/export. */
 import type { WorkbenchState } from '../shell.tsx'
-import { R, h, Button, Card, Field, Modal, ErrorBox, Empty, Select, Spinner, keyboardActivate } from '../ui.tsx'
+import { R, h, Button, Card, Field, Modal, ErrorBox, Select, Toggle, keyboardActivate } from '../ui.tsx'
 import { api, uploadFile, assetThumb, downloadPost, type Rec } from '../api.ts'
-import { Icon } from '../icons.tsx'
+import { Icon, type IconName } from '../icons.tsx'
 import { ImagePreview } from '../image.tsx'
+import { clearPendingDraft } from '../draft-cache.ts'
+import { dateTimeLabel } from '../format.ts'
+import { appendScenePrompt, appendPresetCharacters, entryPrompt } from '../../src/workbench/library.ts'
 
 const KINDS = [
-  ['character', '角色'], ['branch', '分支'], ['artist', '画师'], ['blend', '混合'], ['preset', '预设'],
+  ['all', '全部'], ['character', '角色'], ['branch', '分支'], ['artist', '画师'], ['blend', '混合'], ['preset', '预设'],
 ] as const
+const KIND_LABEL: Record<string, string> = Object.fromEntries(KINDS.map(([value, label]) => [value, label]))
+const KIND_ICON: Record<string, IconName> = { character: 'users', branch: 'layers', artist: 'brush', blend: 'layers', preset: 'sparkles' }
+const SORTS = [
+  ['updated', '最近更新'], ['created', '最近创建'], ['name', '名称'], ['used', '最常使用'], ['favorite', '收藏优先'], ['kind', '类型'],
+] as const
+const PAGE_SIZE = 48
+const EMPTY_FACETS: Rec = { all: 0, kinds: {}, favorites: 0, tags: [] }
+
+type LibraryQueryResult = {
+  items?: Rec[]
+  total?: number
+  next_offset?: number | null
+  facets?: Rec
+}
 
 export function LibraryPanel({ state }: { state: WorkbenchState }): Rec {
   const r = R()
-  const [kind, setKind] = r.useState<string>('character')
+  const [kind, setKind] = r.useState<string>('all')
   const [query, setQuery] = r.useState('')
+  const [queryInput, setQueryInput] = r.useState('')
+  const [favorite, setFavorite] = r.useState(false)
+  const [tag, setTag] = r.useState('')
+  const [sort, setSort] = r.useState('updated')
   const [rows, setRows] = r.useState<Rec[]>([])
-  const [allCharacters, setAllCharacters] = r.useState<Rec[]>([])
-  const [allBranches, setAllBranches] = r.useState<Rec[]>([])
+  const [total, setTotal] = r.useState(0)
+  const [facets, setFacets] = r.useState<Rec>(EMPTY_FACETS)
+  const [nextOffset, setNextOffset] = r.useState<number | null>(null)
   const [editing, setEditing] = r.useState<Rec | null>(null)
+  const [context, setContext] = r.useState<Rec[]>([])
   const [error, setError] = r.useState<string | null>(null)
   const [busy, setBusy] = r.useState(false)
+  const [loadingMore, setLoadingMore] = r.useState(false)
+  const [selected, setSelected] = r.useState<Set<string>>(() => new Set())
+  const [exportBusy, setExportBusy] = r.useState(false)
+  const [favoriteBusy, setFavoriteBusy] = r.useState<string | null>(null)
   const [importOpen, setImportOpen] = r.useState(false)
+  const exportPending = r.useRef(false)
   const loadVersion = r.useRef(0)
+  const contextRef = r.useRef<Rec[] | null>(null)
+  const contextPending = r.useRef<Promise<Rec[]> | null>(null)
+
+  const load = async (offset = 0, mode: 'replace' | 'append' = 'replace'): Promise<void> => {
+    const version = ++loadVersion.current
+    if (mode === 'replace') setBusy(true)
+    else setLoadingMore(true)
+    const params = new URLSearchParams({
+      kind, query, favorite: String(favorite), sort,
+      offset: String(offset), limit: String(PAGE_SIZE),
+    })
+    if (tag) params.set('tag', tag)
+    try {
+      const result = await api<LibraryQueryResult>(`/library/query?${params.toString()}`)
+      if (version !== loadVersion.current) return
+      const items = Array.isArray(result.items) ? result.items : []
+      setRows((current) => mode === 'append' ? [...current, ...items] : items)
+      // Legacy/fully hydrated rows can double as the editor's composition context.
+      if (items.length && items.every((row) => row['data'])) contextRef.current = items
+      setTotal(Number(result.total ?? 0))
+      setFacets(result.facets ?? EMPTY_FACETS)
+      setNextOffset(result.next_offset ?? null)
+      if (mode === 'replace') setSelected((current) => new Set([...current].filter((id) => items.some((row) => row['id'] === id))))
+      setError(null)
+    } catch (e) {
+      if (version === loadVersion.current) setError((e as Error).message)
+    } finally {
+      if (version === loadVersion.current) { setBusy(false); setLoadingMore(false) }
+    }
+  }
+
+  const ensureContext = async (): Promise<Rec[]> => {
+    if (contextRef.current) return contextRef.current
+    if (!contextPending.current) {
+      contextPending.current = api<Rec[]>('/library')
+        .then((values) => { contextRef.current = Array.isArray(values) ? values : []; return contextRef.current })
+        .finally(() => { contextPending.current = null })
+    }
+    return contextPending.current
+  }
+
+  const openById = async (id: string): Promise<void> => {
+    try {
+      const [full, contextRows] = await Promise.all([api<Rec>(`/library/${encodeURIComponent(id)}`), ensureContext()])
+      setContext(contextRows)
+      setEditing(structuredClone(full))
+    } catch (e) { setError((e as Error).message) }
+  }
+
+  const openEntry = (entry: Rec): void => {
+    if (entry['data']) {
+      setEditing(structuredClone(entry))
+      if (contextRef.current) setContext(contextRef.current)
+      else void ensureContext().then(setContext).catch((e) => setError((e as Error).message))
+      return
+    }
+    void openById(String(entry['id']))
+  }
+
+  const newEntrySeed = (): Rec => ({
+    kind: kind === 'all' ? 'character' : kind,
+    name: '',
+    data: { prompt: '', negative_prompt: '', prompt_sets: [], examples: [], notes: '', tags: [], favorite: false },
+  })
+
+  const createEntry = (seed?: Rec): void => {
+    if (contextRef.current) {
+      setContext(contextRef.current)
+      setEditing(seed ?? newEntrySeed())
+      return
+    }
+    void ensureContext().then((contextRows) => {
+      setContext(contextRows)
+      setEditing(seed ?? newEntrySeed())
+    }).catch((e) => setError((e as Error).message))
+  }
+
+  const refreshContext = (): void => { contextRef.current = null; contextPending.current = null }
+
+  r.useEffect(() => {
+    if (queryInput === query) return
+    const timer = setTimeout(() => setQuery(queryInput), 300)
+    return () => clearTimeout(timer)
+  }, [queryInput, query])
+  r.useEffect(() => { void load(0, 'replace') }, [kind, query, favorite, tag, sort])
+  r.useEffect(() => { setSelected(new Set()) }, [kind, query, favorite, tag, sort])
   r.useEffect(() => {
     if (!state.librarySeed) return
-    setKind(String(state.librarySeed['kind'] ?? 'preset'))
-    setEditing(structuredClone(state.librarySeed))
+    const seed = structuredClone(state.librarySeed)
+    setKind(String(seed['kind'] ?? 'preset'))
+    setEditing(seed)
+    void ensureContext().then(setContext).catch((e) => setError((e as Error).message))
     state.clearLibrarySeed?.()
   }, [state.librarySeed])
 
-  const load = async (): Promise<void> => {
-    const version = ++loadVersion.current
-    setBusy(true)
-    try {
-      const [resRows, resAll] = await Promise.all([
-        api<Rec[]>(`/library?kind=${kind}&query=${encodeURIComponent(query)}`),
-        api<Rec[]>('/library'),
-      ])
-      if (version !== loadVersion.current) return
-      setRows(resRows)
-      setAllCharacters(resAll.filter((e) => e['kind'] === 'character'))
-      setAllBranches(resAll.filter((e) => e['kind'] === 'branch'))
-      setError(null)
-    } catch (e) { if (version === loadVersion.current) setError((e as Error).message) } finally { if (version === loadVersion.current) setBusy(false) }
+  const exportLibrary = async (ids: string[] | null): Promise<void> => {
+    if (exportPending.current || (ids && !ids.length)) return
+    exportPending.current = true
+    setExportBusy(true)
+    setError(null)
+    try { await downloadPost('/library/export', ids ? { ids } : {}, ids ? 'atelier-library-selection.zip' : 'atelier-library.zip') }
+    catch (e) { setError((e as Error).message) }
+    finally { exportPending.current = false; setExportBusy(false) }
   }
-  R().useEffect(() => { void load() }, [kind, query])
 
   const remove = async (entry: Rec): Promise<void> => {
     if (!confirm(`删除「${String(entry['name'])}」？`)) return
     try {
       await api(`/library/${encodeURIComponent(String(entry['id']))}?revision=${String(entry['revision'])}`, 'DELETE')
-      await load()
+      refreshContext()
+      await load(0, 'replace')
     } catch (e) { setError((e as Error).message) }
+  }
+
+  const toggleFavorite = async (entry: Rec): Promise<void> => {
+    const id = String(entry['id'])
+    if (favoriteBusy) return
+    setFavoriteBusy(id)
+    try {
+      const saved = await api<Rec>(`/library/${encodeURIComponent(id)}/favorite`, 'POST', {
+        favorite: entry['favorite'] !== true, revision: entry['revision'],
+      })
+      setRows((current) => current.map((row) => row['id'] === id ? { ...row, favorite: saved['data']?.['favorite'] === true, revision: saved['revision'] } : row))
+      void load(0, 'replace')
+    } catch (e) { setError((e as Error).message) }
+    finally { setFavoriteBusy(null) }
   }
 
   const applyToDraft = async (entry: Rec, promptSet = -1): Promise<void> => {
@@ -69,127 +193,180 @@ export function LibraryPanel({ state }: { state: WorkbenchState }): Rec {
       characters.push({ prompt: p, negative_prompt: np })
       req['characters'] = characters
     } else {
-      req['prompt'] = [req['prompt'], p].filter(Boolean).join(', ')
+      req['prompt'] = appendScenePrompt(String(req['prompt'] ?? ''), p)
       if (np) req['negative_prompt'] = [req['negative_prompt'], np].filter(Boolean).join(', ')
+      if (entry['kind'] === 'preset' && promptSet === -1) appendPresetCharacters(req, (preview['entry']?.['data'] ?? entry['data'] ?? {}) as Rec)
     }
     const refs = ((draft['library_refs'] ?? []) as Rec[]).slice()
     refs.push({ id: entry['id'], revision: preview['entry']?.['revision'] ?? entry['revision'], name: entry['name'], parent_id: entry['parent_id'] ?? entry['id'], prompt_set: promptSet, ...(slot !== null ? { slot } : {}) })
     await state.patchDraft({ id: draft['id'], request: req, library_refs: refs }, Number(draft['revision']))
+    clearPendingDraft(String(draft['id']))
+    // Usage data is advisory; the draft application must not fail if it cannot be recorded.
+    void api(`/library/${encodeURIComponent(String(entry['id']))}/use`, 'POST', {}).catch(() => {})
   }
 
-  return Card({ title: '资料库' },
-    h('div', { className: 'nai-toolbar' },
-      Select({ value: kind, onChange: setKind, options: KINDS.map(([v, l]) => ({ value: v, label: l })) }),
-      h('div', { className: 'nai-search' }, h(Icon, { name: 'search' }), h('input', {
-        'aria-label': '搜索资料', placeholder: '搜索名称或内容…', value: query,
-        onChange: (e: Rec) => setQuery((e.target as HTMLInputElement).value),
+  const kindCount = (value: string): number => value === 'all'
+    ? Number(facets['kinds'] ? Object.values(facets['kinds'] as Rec).reduce((sum: number, count) => sum + Number(count), 0) : total)
+    : Number((facets['kinds'] as Rec | undefined)?.[value] ?? 0)
+  const tags = Array.isArray(facets['tags']) ? facets['tags'] as Rec[] : []
+  const hasFilter = Boolean(query || favorite || tag || (kind !== 'all'))
+  const selectedVisible = [...selected].filter((id) => rows.some((row) => String(row['id']) === id))
+
+  const renderCard = (entry: Rec): Rec => {
+    const id = String(entry['id'])
+    const isBranch = entry['kind'] === 'branch'
+    const isCharacter = entry['kind'] === 'character'
+    const parentName = String(entry['parent_name'] ?? '')
+    const displayName = isBranch && parentName ? `${parentName} - ${String(entry['name'])}` : String(entry['name'])
+    const prompt = String(entry['prompt_preview'] ?? '')
+    const tagsOfEntry = Array.isArray(entry['tags']) ? entry['tags'] as string[] : []
+    const branches = Array.isArray(entry['branches']) ? entry['branches'] as Rec[] : []
+    const cover = entry['cover_asset_id'] ? assetThumb(String(entry['cover_asset_id'])) : ''
+    return h('div', {
+      className: 'nai-lib-card', key: id, role: 'group', tabIndex: 0,
+      'data-kind': String(entry['kind']), 'aria-label': displayName,
+      onKeyDown: keyboardActivate(() => openEntry(entry)),
+      onClick: () => openEntry(entry),
+    },
+      h('label', { className: 'nai-library-selection', onClick: (event: Rec) => event.stopPropagation() }, h('input', {
+        type: 'checkbox', 'aria-label': `选择资料 ${displayName}`, checked: selected.has(id),
+        onChange: (event: Rec) => setSelected((current) => { const next = new Set(current); event.target.checked ? next.add(id) : next.delete(id); return next }),
       })),
-      Button({ onClick: () => setEditing({ kind, name: '', data: { prompt: '', negative_prompt: '', prompt_sets: [], examples: [], notes: '' } }) }, '＋ 新建'),
-      h('span', { style: { flex: 1 } }),
-      Button({ small: true, onClick: () => { void downloadPost('/library/export', {}, 'atelier-library.zip').catch((e) => setError((e as Error).message)) } }, '导出全部'),
-      Button({ small: true, onClick: () => setImportOpen(true) }, '导入'),
-    ),
-    ErrorBox({ error }),
-    busy && !rows.length ? Empty({ text: '加载中 ' + '' }) : null,
-    !busy && !rows.length ? Empty({ text: query ? '没有匹配的资料' : '暂无资料' }) : null,
-    h('div', { className: 'nai-lib-grid' }, rows.map((entry) => {
-      const examples = ((entry['data'] as Rec)?.['examples'] ?? []) as string[]
-      const p = String((entry['data'] as Rec)?.['prompt'] ?? '')
-      const np = String((entry['data'] as Rec)?.['negative_prompt'] ?? '')
-      const id = String(entry['id'])
-      const isBranch = entry['kind'] === 'branch'
-      const isCharacter = entry['kind'] === 'character'
-      const parentEntry = isBranch ? allCharacters.find((c) => c['id'] === entry['parent_id']) : null
-      const parentName = isBranch ? String(entry['parent_name'] ?? parentEntry?.['name'] ?? '') : ''
-      const displayName = isBranch && parentName ? `${parentName} - ${String(entry['name'])}` : String(entry['name'])
-      const childBranches = isCharacter ? allBranches.filter((b) => b['parent_id'] === id) : []
-      return h('div', {
-        className: 'nai-lib-card', key: id, role: 'group', tabIndex: 0,
-        'aria-label': displayName, onKeyDown: keyboardActivate(() => setEditing(structuredClone(entry))),
-        onClick: () => setEditing(structuredClone(entry)),
-      },
-        h('div', { className: 'preview-box' },
-          examples.length
-            ? h(ImagePreview, { alt: displayName, src: assetThumb(String(examples[0])) })
-            : h('div', { className: 'preview-empty' },
-                h(Icon, { name: entry['kind'] === 'artist' ? 'brush' : entry['kind'] === 'blend' ? 'layers' : 'users', size: 28 }),
-                h('span', { style: { fontSize: 11, color: 'var(--nai-faint)' } }, '暂无例图')),
-          h('div', { style: { position: 'absolute', top: 8, left: 8, display: 'flex', gap: 4 } },
-            h('span', { className: 'nai-pill', style: { padding: '2px 8px', fontSize: 10, background: 'rgba(24,26,29,0.88)', color: '#fff', border: '1px solid rgba(255,255,255,0.1)' } },
-              isBranch && parentName ? `${parentName} · 分支` : (KINDS.find(([k]) => k === entry['kind'])?.[1] ?? String(entry['kind']))),
-          ),
-          examples.length > 1 ? h('div', { style: { position: 'absolute', bottom: 8, right: 8 } },
-            h('span', { className: 'nai-pill', style: { padding: '1px 6px', fontSize: 10, background: 'rgba(0,0,0,0.7)', color: '#fff' } }, h(Icon, { name: 'image', size: 12 }), `${examples.length} 张例图`)) : null,
+      h('button', {
+        type: 'button', className: `nai-lib-favorite ${entry['favorite'] === true ? 'active' : ''}`,
+        title: entry['favorite'] === true ? '取消收藏' : '收藏此资料',
+        'aria-label': entry['favorite'] === true ? `取消收藏 ${displayName}` : `收藏 ${displayName}`,
+        disabled: favoriteBusy === id,
+        onClick: (event: Rec) => { event.stopPropagation(); void toggleFavorite(entry) },
+      }, h(Icon, { name: 'star', size: 14 })),
+      h('div', { className: 'preview-box' },
+        cover
+          ? h(ImagePreview, { alt: displayName, src: cover })
+          : h('div', { className: 'preview-empty' },
+              h('span', { className: 'nai-lib-glyph' }, h(Icon, { name: KIND_ICON[String(entry['kind'])] ?? 'library', size: 30 })),
+              h('span', null, '暂无例图')),
+        h('span', { className: 'nai-lib-kind' }, isBranch && parentName ? `${parentName} · 分支` : (KIND_LABEL[String(entry['kind'])] ?? String(entry['kind']))),
+        Number(entry['example_count'] ?? 0) > 1 ? h('span', { className: 'nai-lib-examples' }, h(Icon, { name: 'image', size: 11 }), String(entry['example_count'])) : null,
+      ),
+      h('div', { className: 'content' },
+        h('div', { className: 'header-row' },
+          h('div', { className: 'name', title: displayName }, displayName),
+          h('span', { className: 'nai-pill nai-lib-revision' }, `v${String(entry['revision'])}`),
         ),
-        h('div', { className: 'content' },
-          h('div', { className: 'header-row' },
-            h('div', { className: 'name', title: displayName }, displayName),
-            h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 5px' } }, `v${String(entry['revision'])}`),
-          ),
-          h('div', { className: 'prompt-preview', title: p || '无提示词' },
-            p || h('span', { style: { color: 'var(--nai-faint)' } }, '（未设置主提示词）')),
-          isCharacter && childBranches.length > 0 ? h('div', {
-            style: { display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center', margin: '4px 0 2px' }
-          },
-            h('span', { style: { fontSize: 10, color: 'var(--nai-faint)' } }, '分支:'),
-            childBranches.map((b) => h('button', {
-              type: 'button',
-              key: String(b['id']),
-              className: 'nai-pill',
-              title: `点击跳转编辑「${String(b['name'])}」`,
-              style: {
-                cursor: 'pointer', padding: '1px 6px', fontSize: 10,
-                background: 'var(--nai-panel-2)',
-                border: '1px solid var(--nai-border-soft)',
-                color: 'var(--nai-accent)',
+        h('div', { className: 'prompt-preview', title: prompt || '无提示词' },
+          prompt || h('span', { className: 'faint' }, '（未设置主提示词）')),
+        tagsOfEntry.length ? h('div', { className: 'nai-lib-tagline' },
+          tagsOfEntry.slice(0, 3).map((value) => h('button', {
+            type: 'button', key: value, className: 'nai-tag click', title: `按标签筛选：${value}`,
+            onClick: (event: Rec) => { event.stopPropagation(); setTag(value) },
+          }, value)),
+          tagsOfEntry.length > 3 ? h('span', { className: 'nai-tag' }, `+${tagsOfEntry.length - 3}`) : null) : null,
+        isCharacter && branches.length ? h('div', { className: 'nai-lib-branches' },
+          h('span', { className: 'faint' }, '分支'),
+          branches.map((branch) => h('button', {
+            type: 'button', key: String(branch['id']), className: 'nai-pill', title: `打开分支「${String(branch['name'])}」`,
+            onClick: (event: Rec) => { event.stopPropagation(); void openById(String(branch['id'])) },
+          }, h(Icon, { name: 'layers', size: 11 }), String(branch['name'])))) : null,
+        h('div', { className: 'nai-lib-meta' },
+          h('span', null, `${Number(entry['use_count'] ?? 0) ? `用过 ${Number(entry['use_count'])} 次` : '未使用'}`),
+          Number(entry['prompt_set_count'] ?? 0) ? h('span', null, `${Number(entry['prompt_set_count'])} 组词`) : null,
+          entry['last_used_at'] ? h('span', null, `最近 ${dateTimeLabel(entry['last_used_at'])}`) : null),
+        h('div', { className: 'actions' },
+          Button({
+            small: true, kind: 'primary', icon: 'copy',
+            onClick: (event: Rec) => { event.stopPropagation(); void applyToDraft(entry).then(() => state.go('create')).catch((error) => setError((error as Error).message)) },
+            title: '将该资料填入当前创作草稿并切换至创作页',
+          }, '填入草稿'),
+          h('div', { className: 'nai-lib-card-tools' },
+            isBranch && parentName ? Button({
+              small: true, kind: 'ghost', icon: 'users',
+              onClick: (event: Rec) => { event.stopPropagation(); void openById(String(entry['parent_id'])) },
+              title: `跳转到角色「${parentName}」本体`,
+            }, '本体') : null,
+            isCharacter ? Button({
+              small: true, kind: 'ghost', icon: 'plus',
+              onClick: (event: Rec) => {
+                event.stopPropagation()
+                void ensureContext().then((contextRows) => {
+                  setContext(contextRows)
+                  setEditing({ kind: 'branch', parent_id: id, name: '', data: { prompt: '', negative_prompt: '', prompt_sets: [], examples: [], notes: '', tags: [], favorite: false } })
+                }).catch((error) => setError((error as Error).message))
               },
-              onClick: (e: Rec) => {
-                e.stopPropagation()
-                setEditing(structuredClone(b))
-              },
-            }, h(Icon, { name: 'layers', size: 12 }), String(b['name']))),
-          ) : null,
-          h('div', { className: 'actions' },
+              title: '为此角色新建分支',
+            }, '分支') : null,
             Button({
-              small: true, kind: 'primary',
-              onClick: (e: Rec) => { e.stopPropagation(); void applyToDraft(entry).then(() => state.go('create')).catch((error) => setError((error as Error).message)) },
-              title: '将该资料填入当前创作草稿并切换至创作页',
-            }, '⤵ 填入草稿'),
-            h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-              isBranch && parentEntry ? Button({
-                small: true, kind: 'ghost',
-                onClick: (e: Rec) => { e.stopPropagation(); setEditing(structuredClone(parentEntry)) },
-                title: `跳转到角色「${parentName}」本体`,
-              }, '👤 本体') : null,
-              isCharacter ? Button({
-                small: true, kind: 'ghost',
-                onClick: (e: Rec) => {
-                  e.stopPropagation()
-                  setEditing({ kind: 'branch', parent_id: id, name: '', data: { prompt: '', negative_prompt: '', prompt_sets: [], examples: [], notes: '' } })
-                },
-                title: '为此角色新建分支',
-              }, '＋ 分支') : null,
-              Button({
-                small: true, kind: 'ghost',
-                onClick: (e: Rec) => { e.stopPropagation(); setEditing(structuredClone(entry)) },
-              }, '✎ 编辑'),
-              h('button', {
-                type: 'button', className: 'nai-icon-btn', 'aria-label': '删除资料',
-                onClick: (e: Rec) => { e.stopPropagation(); void remove(entry) },
-                title: '删除此资料',
-                style: { cursor: 'pointer', color: 'var(--nai-danger)', padding: '2px 6px', fontSize: 13 },
-              }, h(Icon, { name: 'trash' })),
-            ),
+              small: true, kind: 'ghost', icon: 'edit',
+              onClick: (event: Rec) => { event.stopPropagation(); openEntry(entry) },
+            }, '编辑'),
+            Button({
+              small: true, kind: 'ghost', icon: 'trash', iconOnly: true,
+              onClick: (event: Rec) => { event.stopPropagation(); void remove(entry) },
+              title: '删除此资料',
+              style: { color: 'var(--nai-danger)' },
+            }),
           ),
         ),
-      )
-    })),
+      ),
+    )
+  }
+
+  return Card({},
+    h('div', { className: 'nai-lib-head' },
+      h('div', { className: 'nai-lib-heading' },
+        h('h2', { className: 'nai-section-title' }, '资料库'),
+        h('span', { className: 'nai-lib-count' }, `${total} 条资料${favorite ? ' · 收藏' : ''}${tag ? ` · #${tag}` : ''}`)),
+      h('div', { className: 'nai-lib-head-actions' },
+        Button({ icon: 'plus', onClick: () => createEntry() }, '＋ 新建'),
+        Button({ small: true, kind: 'ghost', icon: 'upload', onClick: () => setImportOpen(true) }, '导入'),
+        Button({ small: true, kind: 'ghost', icon: 'download', disabled: exportBusy || !total, onClick: () => void exportLibrary(null) }, '导出全部'))),
+    h('div', { className: 'nai-lib-searchrow' },
+      h('div', { className: 'nai-search' }, h(Icon, { name: 'search' }), h('input', {
+        'aria-label': '搜索资料', placeholder: '搜索名称、标签或内容…', value: queryInput,
+        onChange: (e: Rec) => setQueryInput((e.target as HTMLInputElement).value),
+      })),
+      Select({ value: sort, ariaLabel: '资料排序', onChange: setSort, options: SORTS.map(([value, label]) => ({ value, label })) }),
+      h(Toggle, { checked: favorite, onChange: setFavorite, label: '只看收藏' })),
+    h('div', { className: 'nai-lib-kinds', role: 'group', 'aria-label': '资料类型' },
+      KINDS.map(([value, label]) => h('button', {
+        type: 'button', key: value, className: value === kind ? 'active' : '',
+        'aria-pressed': value === kind, onClick: () => setKind(value),
+      }, h('span', null, label), h('span', { className: 'nai-lib-chip-count' }, String(kindCount(value)))))),
+    tags.length ? h('div', { className: 'nai-lib-tags', 'aria-label': '标签筛选' },
+      h(Icon, { name: 'tag', size: 13 }),
+      tags.map((item) => {
+        const value = String(item['name'])
+        return h('button', {
+          type: 'button', key: value, className: `nai-tag click ${tag === value ? 'active' : ''}`,
+          title: `按标签筛选：${value}`, onClick: () => setTag(tag === value ? '' : value),
+        }, `#${value}`, h('span', { className: 'nai-lib-chip-count' }, String(item['count'])))
+      })) : null,
+    ErrorBox({ error }),
+    busy && !rows.length ? h('div', { className: 'nai-lib-grid' }, Array.from({ length: 6 }, (_, index) => h('div', { key: `skeleton-${index}`, className: 'nai-lib-card nai-skeleton' },
+      h('div', { className: 'skeleton-block skeleton-cover' }), h('div', { className: 'skeleton-block skeleton-line' }), h('div', { className: 'skeleton-block skeleton-line short' })))) : null,
+    !busy && !rows.length ? h('div', { className: 'nai-empty nai-empty-rich' },
+      h('span', { className: 'nai-empty-glyph' }, h(Icon, { name: hasFilter ? 'search' : 'library', size: 34 })),
+      h('strong', null, hasFilter ? '没有匹配的资料' : '资料库还是空的'),
+      h('p', null, hasFilter ? '换一个关键词、类型或标签试试；也可以清除全部筛选。' : '把角色、画师、混合方案或常用预设存进来，下次填入草稿只需一次点击。'),
+      hasFilter
+        ? Button({ icon: 'undo', onClick: () => { setQuery(''); setQueryInput(''); setFavorite(false); setTag(''); setKind('all') } }, '清除筛选')
+        : Button({ icon: 'plus', kind: 'primary', onClick: () => createEntry() }, '新建第一条资料')) : null,
+    rows.length ? h('div', { className: 'nai-lib-grid', 'data-layout': 'masonry', 'aria-label': '资料瀑布流' }, rows.map(renderCard)) : null,
+    selectedVisible.length ? h('div', { className: 'nai-selection-bar', role: 'status' },
+      h('strong', null, `已选择 ${selectedVisible.length} 项`),
+      Button({ small: true, icon: 'download', disabled: exportBusy, onClick: () => void exportLibrary(selectedVisible) }, `导出所选 (${selectedVisible.length})`),
+      Button({ small: true, icon: 'close', iconOnly: true, kind: 'ghost', title: '取消选择', disabled: exportBusy, onClick: () => setSelected(new Set()) })) : null,
+    h('div', { className: 'nai-lib-pager' },
+      h('span', { className: 'faint' }, rows.length ? `已显示 ${rows.length} / ${total}` : ''),
+      h('span', { style: { flex: 1 } }),
+      Button({ small: true, kind: 'ghost', disabled: busy || !rows.length, onClick: () => setSelected(new Set(rows.map((row) => String(row['id'])))) }, '选择当前结果'),
+      nextOffset !== null ? Button({ small: true, icon: loadingMore ? 'loader' : 'download', disabled: loadingMore, onClick: () => void load(nextOffset, 'append') }, loadingMore ? '加载中…' : '加载更多') : null),
     editing ? h(EntryEditor, {
       entry: editing,
-      allCharacters,
-      allBranches,
+      allEntries: context,
+      allCharacters: context.filter((value) => value['kind'] === 'character'),
+      allBranches: context.filter((value) => value['kind'] === 'branch'),
       onClose: () => setEditing(null),
-      onSaved: () => { setEditing(null); void load() },
+      onSaved: () => { setEditing(null); refreshContext(); void load(0, 'replace') },
       onApplyToDraft: applyToDraft,
       onApplied: () => state.go('create'),
       guardNavigation: state.guardNavigation,
@@ -210,7 +387,8 @@ export function LibraryPanel({ state }: { state: WorkbenchState }): Rec {
         data.append('expected_revisions', JSON.stringify(expectedRevisions))
         await api('/library/import-merge', 'POST', data)
         setImportOpen(false)
-        await load()
+        refreshContext()
+        await load(0, 'replace')
       },
       fail: (e: unknown) => setError((e as Error).message),
     }) : null,
@@ -218,9 +396,10 @@ export function LibraryPanel({ state }: { state: WorkbenchState }): Rec {
 }
 
 function EntryEditor({
-  entry, allCharacters, allBranches, onClose, onSaved, onApplyToDraft, onSwitchEntry, fail, guardNavigation, onApplied
+  entry, allEntries, allCharacters, allBranches, onClose, onSaved, onApplyToDraft, onSwitchEntry, fail, guardNavigation, onApplied
 }: {
   entry: Rec
+  allEntries: Rec[]
   allCharacters: Rec[]
   allBranches: Rec[]
   onClose: () => void
@@ -268,6 +447,11 @@ function EntryEditor({
 
   const parentEntry = isBranch ? allCharacters.find((c) => c['id'] === value['parent_id']) : null
   const parentName = parentEntry ? String(parentEntry['name']) : ''
+  let composed: { prompt: string; negative: string } | null = null
+  let previewError: string | null = null
+  try {
+    composed = entryPrompt(value, [...allEntries.filter((item) => item['id'] !== value['id']), value], promptSet)
+  } catch (e) { previewError = (e as Error).message }
 
   const switchTarget = (target: Rec): void => {
     if (!canLeave()) return
@@ -297,6 +481,20 @@ function EntryEditor({
     } catch (e) { setError((e as Error).message) }
     finally { savePending.current = false; setSaving(false) }
   }
+  // Ctrl/Cmd+S saves from anywhere inside the editor; the ref keeps one listener
+  // bound to the latest closure instead of re-registering on every keystroke.
+  const saveRef = r.useRef(save)
+  saveRef.current = save
+  r.useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = (event: KeyboardEvent): void => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
+      event.preventDefault()
+      void saveRef.current()
+    }
+    window.addEventListener('keydown', handler, true)
+    return () => window.removeEventListener('keydown', handler, true)
+  }, [])
   const addExample = async (file: File): Promise<void> => {
     if (savePending.current) return
     const version = editorVersion.current
@@ -324,13 +522,12 @@ function EntryEditor({
   return h(Modal, {
     title: modalTitle, onClose: close, wide: true,
     footer: h('div', { className: 'modal-actions' },
-      ErrorBox({ error }),
-      promptSets.length ? Field({ label: '应用词组' }, Select({ value: String(promptSet), onChange: (selected: string) => setPromptSet(Number(selected)), options: [{ value: '-1', label: '主提示词' }, ...promptSets.map((group, index) => ({ value: String(index), label: String(group['name'] ?? `组 ${index + 1}`) }))] })) : null,
       onApplyToDraft ? Button({ kind: 'ghost', disabled: saving || uploadCount > 0, onClick: () => void save(true), title: '保存编辑后填入当前创作草稿' }, '保存并填入草稿') : null,
       Button({ onClick: close, disabled: saving }, '取消'),
-      Button({ kind: 'primary', disabled: saving || uploadCount > 0, onClick: () => void save() }, '保存')),
+      Button({ kind: 'primary', disabled: saving || uploadCount > 0, title: '保存（Ctrl/⌘+S）', onClick: () => void save() }, '保存')),
   },
     h('fieldset', { disabled: saving, style: { border: 0, padding: 0, margin: 0, minWidth: 0 } },
+    ErrorBox({ error }),
     h('div', { className: 'nai-row' },
       h(Field, { label: '类型' }, Select({
         value: String(value['kind']), disabled: !isNew,
@@ -350,21 +547,55 @@ function EntryEditor({
             style: { flex: 1 },
           }),
           parentEntry ? Button({
-            small: true, kind: 'ghost',
+            small: true, kind: 'ghost', icon: 'users',
             onClick: () => switchTarget(parentEntry),
             title: `快速跳转到角色「${parentName}」本体`,
-          }, '👤 角色本体') : null,
+          }, '角色本体') : null,
         ),
       ) : null,
     ),
+    h('div', { className: 'nai-grid nai-lib-editor-meta', style: { gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'end' } },
+      Field({ label: '标签', hint: '用逗号分隔，用于检索与画廊筛选；最多 16 个' }, h('input', {
+        'aria-label': '资料标签',
+        value: (Array.isArray(data['tags']) ? data['tags'] as string[] : []).join(', '),
+        placeholder: '例如：黑发, 红瞳, 制服',
+        onChange: (e: Rec) => {
+          data['tags'] = (e.target as HTMLInputElement).value.split(/[,，]/u).map((tag) => tag.trim()).filter(Boolean)
+          setValue({ ...value })
+        },
+      })),
+      h('div', { className: 'nai-lib-editor-side' },
+        Toggle({
+          checked: data['favorite'] === true, label: '收藏此资料',
+          onChange: (checked: boolean) => setValue({ ...value, data: { ...data, favorite: checked } }),
+        }),
+        h('span', { className: 'nai-lib-usage' },
+          Number(data['use_count'] ?? 0) ? `使用 ${Number(data['use_count'])} 次` : '尚未使用',
+          data['last_used_at'] ? ` · 最近 ${dateTimeLabel(data['last_used_at'])}` : ''))),
     h('div', { style: { height: 8 } }),
     h('div', { className: 'nai-grid', style: { gridTemplateColumns: '1fr 1fr' } },
       Field({
         label: '主提示词',
         hint: ['character', 'branch'].includes(String(value['kind'])) ? '定义角色专属的发型、瞳色、服装等身份特征' : undefined
-      }, h('textarea', { value: String(data['prompt'] ?? ''), style: { minHeight: 70 }, onChange: (e: Rec) => { data['prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) } })),
-      Field({ label: '主负面' }, h('textarea', { value: String(data['negative_prompt'] ?? ''), style: { minHeight: 70 }, onChange: (e: Rec) => { data['negative_prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) } })),
+      }, h('textarea', {
+        id: 'nai-lib-entry-prompt',
+        value: String(data['prompt'] ?? ''),
+        style: { minHeight: 70 },
+        placeholder: '输入主提示词…支持 tag 与自然语言混合',
+        onChange: (e: Rec) => { data['prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) }
+      })),
+      Field({ label: '主负面' }, h('textarea', {
+        id: 'nai-lib-entry-negative',
+        value: String(data['negative_prompt'] ?? ''),
+        style: { minHeight: 70 },
+        placeholder: '输入主负面提示词…',
+        onChange: (e: Rec) => { data['negative_prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) }
+      })),
     ),
+    isBranch ? h(Toggle, {
+      checked: !data['replace_identity'], label: '继承角色本体提示词',
+      onChange: (inherit: boolean) => setValue({ ...value, data: { ...data, replace_identity: !inherit } }),
+    }) : null,
     value['kind'] === 'blend' ? h(BlendEditor, { data, onChange: () => setValue({ ...value }) }) : null,
     isCharacter ? h('div', {
       style: {
@@ -381,7 +612,7 @@ function EntryEditor({
         ),
         h('span', { style: { flex: 1 } }),
         !isNew ? Button({
-          small: true, kind: 'primary',
+          small: true, kind: 'primary', icon: 'plus',
           onClick: () => {
             switchTarget({
               kind: 'branch',
@@ -391,11 +622,11 @@ function EntryEditor({
             })
           },
           title: '为此角色创建新分支（如默认服装、泳装、战斗形态等）',
-        }, '＋ 新建分支') : null,
+        }, '新建分支') : null,
       ),
       myBranches.length === 0
         ? h('div', { style: { color: 'var(--nai-faint)', fontSize: 12, padding: '2px 0' } },
-            isNew ? '保存角色后可为此角色创建分支' : '该角色暂无分支（可点击右上角「＋ 新建分支」添加，如「默认服装」或「泳装」）'
+            isNew ? '保存角色后可为此角色创建分支' : '该角色暂无分支（可点击右上角「新建分支」添加，如「默认服装」或「泳装」）'
           )
         : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             myBranches.map((b) => {
@@ -420,10 +651,10 @@ function EntryEditor({
                   }, bPrompt || '（无分支提示词）')
                 ),
                 Button({
-                  small: true, kind: 'ghost',
+                  small: true, kind: 'ghost', icon: 'edit',
                   onClick: () => switchTarget(b),
                   title: `跳转编辑分支「${String(b['name'])}」`,
-                }, '✎ 编辑此分支'),
+                }, '编辑此分支'),
               )
             }),
           ),
@@ -432,19 +663,27 @@ function EntryEditor({
       h('div', { className: 'nai-row' },
         h('strong', { style: { fontSize: 12 } }, '提示词组（同一身份的不同形态/服装）'),
         h('span', { style: { flex: 1 } }),
-        Button({ small: true, onClick: () => { promptSets.push({ name: `组 ${promptSets.length + 1}`, prompt: '', negative_prompt: '' }); setValue({ ...value }) } }, '＋ 添加词组')),
+        Button({ small: true, icon: 'plus', onClick: () => { promptSets.push({ name: `组 ${promptSets.length + 1}`, prompt: '', negative_prompt: '' }); setValue({ ...value }) } }, '添加词组')),
       promptSets.map((set, i) => h('div', { className: 'nai-card', key: i, style: { padding: 8, marginTop: 6 } },
         h('div', { className: 'nai-row' },
           h('input', { value: String(set['name'] ?? ''), style: { width: 140 }, onChange: (e: Rec) => { set['name'] = (e.target as HTMLInputElement).value; setValue({ ...value }) } }),
           h('span', { style: { flex: 1 } }),
-          Button({ small: true, kind: 'danger', onClick: () => { promptSets.splice(i, 1); setValue({ ...value }) } }, '删除')),
-        h('textarea', { value: String(set['prompt'] ?? ''), placeholder: '词组提示词', style: { minHeight: 40, width: '100%', marginTop: 4 }, onChange: (e: Rec) => { set['prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) } }),
+          Button({ small: true, kind: 'danger', icon: 'trash', onClick: () => { promptSets.splice(i, 1); setPromptSet((current) => current === i ? -1 : current > i ? current - 1 : current); setValue({ ...value }) } }, '删除')),
+        h('textarea', { 'aria-label': `词组 ${i + 1} 提示词`, value: String(set['prompt'] ?? ''), placeholder: '词组提示词', style: { minHeight: 40, width: '100%', marginTop: 4 }, onChange: (e: Rec) => { set['prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) } }),
+        h('textarea', { 'aria-label': `词组 ${i + 1} 负面提示词`, value: String(set['negative_prompt'] ?? ''), placeholder: '词组负面提示词', style: { minHeight: 40, width: '100%', marginTop: 4 }, onChange: (e: Rec) => { set['negative_prompt'] = (e.target as HTMLTextAreaElement).value; setValue({ ...value }) } }),
       ))),
+    promptSets.length ? h('div', { className: 'nai-row', style: { marginTop: 10 } },
+      h('span', { className: 'faint', style: { fontSize: 11 } }, '预览 / 应用时使用：'),
+      Field({ label: '应用词组' }, Select({ value: String(promptSet), onChange: (selected: string) => setPromptSet(Number(selected)), options: [{ value: '-1', label: '主提示词' }, ...promptSets.map((group, index) => ({ value: String(index), label: String(group['name'] ?? `组 ${index + 1}`) }))] }))) : null,
+    h('div', { className: 'nai-grid', style: { marginTop: 10, gridTemplateColumns: '1fr 1fr' }, 'aria-label': '合成预览' },
+      Field({ label: '合成提示词' }, h('textarea', { readOnly: true, value: composed?.prompt ?? '', style: { minHeight: 60 } })),
+      Field({ label: '合成负面词' }, h('textarea', { readOnly: true, value: composed?.negative ?? '', style: { minHeight: 60 } })),
+      ErrorBox({ error: previewError })),
     h('div', { style: { marginTop: 10 } },
       h('div', { className: 'nai-row' },
         h('strong', { style: { fontSize: 12 } }, '例图'),
         h('span', { style: { flex: 1 } }),
-        h('label', { className: 'nai-btn small' }, '＋ 上传例图',
+        h('label', { className: 'nai-btn small' }, h(Icon, { name: 'plus' }), ' 上传例图',
           h('input', {
             type: 'file', accept: 'image/*', className: 'nai-file-input',
             onChange: (e: Rec) => {
@@ -452,8 +691,18 @@ function EntryEditor({
               if (file) void addExample(file)
             },
           }))),
-      h('div', { className: 'nai-row', style: { marginTop: 8, gap: 10, flexWrap: 'wrap' } },
-        examples.map((id) =>
+      h('div', {
+        className: 'nai-dropzone nai-row',
+        style: { marginTop: 8, gap: 10, flexWrap: 'wrap' },
+        onDragOver: (event: Rec) => { event.preventDefault(); event.stopPropagation() },
+        onDrop: (event: Rec) => {
+          event.preventDefault(); event.stopPropagation()
+          const file = (event.dataTransfer as Rec | undefined)?.files?.[0] as File | undefined
+          if (file) void addExample(file)
+        },
+      },
+        examples.length ? null : h('span', { className: 'nai-dropzone-hint' }, '把图片拖到这里，或使用上方「上传例图」'),
+        examples.map((id, index) =>
           h('span', { key: id, style: { position: 'relative', display: 'inline-block' } },
             h('img', { alt: '资料例图',
               src: assetThumb(id),
@@ -463,6 +712,18 @@ function EntryEditor({
                 display: 'block',
               },
             }),
+            index === 0
+              ? h('span', { className: 'nai-cover-badge' }, '封面')
+              : h('button', {
+                  type: 'button', className: 'nai-cover-action', title: '设为资料卡封面',
+                  onClick: () => {
+                    const idx = examples.indexOf(id)
+                    if (idx <= 0) return
+                    const [moved] = examples.splice(idx, 1)
+                    if (moved) examples.unshift(moved)
+                    setValue({ ...value })
+                  },
+                }, '设为封面'),
             h('button', {
               type: 'button', 'aria-label': '移除此例图',
               onClick: () => { const idx = examples.indexOf(id); if (idx >= 0) { examples.splice(idx, 1); setValue({ ...value }) } },
@@ -470,10 +731,10 @@ function EntryEditor({
               style: {
                 position: 'absolute', top: -6, right: -6, cursor: 'pointer', border: 0, padding: 0,
                 background: 'var(--nai-danger)', color: '#fff', borderRadius: 999,
-                width: 20, height: 20, fontSize: 11, display: 'inline-flex',
+                width: 20, height: 20, display: 'inline-flex',
                 alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 6px rgba(0,0,0,0.4)',
               },
-            }, '✕'),
+            }, h(Icon, { name: 'close', size: 12 })),
           )),
       ),
     ),

@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync, renameSync, unlinkSync, readFileSync } from 'node:fs'
 import { resolve as resolvePath, dirname, join } from 'node:path'
+import { OutputSubdirSchema } from './outputDirectory.ts'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { boundedUnzip } from './archive.ts'
@@ -14,7 +15,15 @@ import { decodeRaster } from './imageInputs.ts'
 
 export const MAX_OUTPUT_PIXELS = 32 * 1024 * 1024
 
+export interface ConnectionTarget {
+  id: string
+  baseUrl: string
+  token: string
+}
+
 export interface ServiceConfig {
+  /** Preferred resolver when several endpoints are configured. */
+  target?: (endpointId?: string) => ConnectionTarget
   token: () => string
   baseUrl: () => string
   proxy: () => string | null
@@ -136,25 +145,35 @@ export class OperationExecutor {
     this.lock = lock
   }
 
-  makeClient(signal?: AbortSignal): NovelAIClient {
+  private targetId(): string | undefined {
+    try { return this.config.target?.()?.id } catch { return undefined }
+  }
+
+  makeClient(signal?: AbortSignal, endpointId?: string): NovelAIClient {
+    let resolved: ConnectionTarget | undefined
+    try { resolved = this.config.target?.(endpointId) } catch (error) { if (endpointId) throw error }
     return new NovelAIClient({
-      token: this.config.token(), baseUrl: this.config.baseUrl(), proxy: this.config.proxy(), signal,
+      token: resolved?.token ?? this.config.token(), baseUrl: resolved?.baseUrl ?? this.config.baseUrl(),
+      proxy: this.config.proxy(), signal,
       retryDelaySeconds: this.config.retryDelaySeconds?.(), retryMaxAttempts: this.config.retryMaxAttempts?.(),
     })
   }
 
   /** Run one prepared operation end-to-end and persist a recovery receipt. */
-  async execute(operation: PreparedOperation, options: { client?: NovelAIClient; outputDir?: string; beforeSubmit?: () => void; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
+  async execute(operation: PreparedOperation, options: { client?: NovelAIClient; endpointId?: string; outputDir?: string; beforeSubmit?: () => void; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
+    // An implicit call runs on the active endpoint; record which one served it.
+    const endpointId = options.endpointId ?? this.targetId()
     const warnings = [...operation.warnings]
     let submissionStarted = false
     this.activeRuns++
     try {
       return await this.lock.run(async () => {
-        const client = options.client ?? this.makeClient(options.signal)
+        const client = options.client ?? this.makeClient(options.signal, options.endpointId)
         options.signal?.throwIfAborted()
         options.beforeSubmit?.()
         options.signal?.throwIfAborted()
-        const directory = resolvePath(options.outputDir ? expandDir(options.outputDir) : expandDir(this.config.outputDir()))
+        let directory = resolvePath(options.outputDir ? expandDir(options.outputDir) : expandDir(this.config.outputDir()))
+        if (operation.output_subdir != null) directory = join(directory, OutputSubdirSchema.parse(operation.output_subdir))
         mkdirSync(directory, { recursive: true })
         const stamp = new Date().toISOString().replace(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}).*$/u, '$1$2$3T$4$5$6Z')
         const id = `${stamp}-${randomUUID().replaceAll('-', '').slice(0, 10)}`
@@ -163,6 +182,7 @@ export class OperationExecutor {
           id, operation: operation.operation, status: 'prepared',
           ...operation.summary, api_payload: redactBinaryPayload(operation.payload),
           endpoint: operation.endpoint, max_anlas: operation.max_anlas, warnings,
+          ...(endpointId ? { endpoint_id: endpointId } : {}),
         }
         const save = () => writeRecord(recordPath, record)
         save()
@@ -177,6 +197,7 @@ export class OperationExecutor {
           id, operation: operation.operation, status: record['status'],
           artifact_paths: [...paths], record_path: recordPath, response_path: record['response_path'],
           max_anlas: operation.max_anlas,
+          ...(endpointId ? { endpoint_id: endpointId } : {}),
           anlas_delta: null, anlas_spent: confirmedNotSubmitted ? 0 : null,
           submission_outcome_unknown: record['submission_outcome_unknown'] === true,
           not_submitted: confirmedNotSubmitted, warnings, dimensions,
@@ -217,7 +238,7 @@ export class OperationExecutor {
               let imageBytes = output.bytes
               let extension = output.extension
               let size = { width: output.width, height: output.height }
-              if (operation.operation === 'inpaint') {
+              if (operation.operation === 'inpaint' || operation.operation === 'outpaint') {
                 const rawPath = join(directory, `${id}.raw${extension}`)
                 writeFileSync(rawPath, imageBytes)
                 record['raw_api_image_path'] = rawPath
@@ -260,9 +281,12 @@ export class OperationExecutor {
         } catch (error) {
           const status = error instanceof NovelAIError ? error.status_code : undefined
           const rejected = status !== undefined && status >= 400 && status < 500 && status !== 408
+          // A 4xx answer is a decision by the server, not a missing submission.
+          const rejectedByServer = rejected && !responseReceived
           confirmedNotSubmitted = !postAttempted || error instanceof NovelAINotSubmitted ||
-            (error instanceof NovelAIError && error.notSubmitted === true) || (!responseReceived && rejected)
-          record['status'] = confirmedNotSubmitted ? 'prepared' : 'failed'
+            (error instanceof NovelAIError && error.notSubmitted === true) || rejectedByServer
+          record['status'] = confirmedNotSubmitted && !rejectedByServer ? 'prepared' : 'failed'
+          if (rejectedByServer) record['server_rejected'] = true
           if (confirmedNotSubmitted) record['not_submitted'] = true
           const errMsg = error instanceof Error ? error.message : String(error)
           record['error'] = errMsg
@@ -309,12 +333,12 @@ export class OperationExecutor {
     } finally { this.activeRuns-- }
   }
 
-  credits(signal?: AbortSignal): Promise<NormalizedCredits> {
-    return this.makeClient(signal).credits(signal)
+  credits(signal?: AbortSignal, endpointId?: string): Promise<NormalizedCredits> {
+    return this.makeClient(signal, endpointId).credits(signal)
   }
 
-  suggestTags(prompt: string, model: string, language: 'en' | 'jp', signal?: AbortSignal) {
-    return this.makeClient(signal).suggestTags(prompt, model, language, signal)
+  suggestTags(prompt: string, model: string, language: 'en' | 'jp', signal?: AbortSignal, endpointId?: string) {
+    return this.makeClient(signal, endpointId).suggestTags(prompt, model, language, signal)
   }
 }
 

@@ -2,7 +2,7 @@
 import { STYLES } from './styles.ts'
 import { setReact, h, type ReactLike } from './ui.tsx'
 import { Shell } from './shell.tsx'
-import { Icon } from './icons.tsx'
+import { AtelierGlyph, AtelierGuideIcon } from './brand.tsx'
 import type { Rec } from './api.ts'
 
 // The esbuild banner wraps this bundle in the DSH lazy-CJS factory whose
@@ -36,8 +36,8 @@ function WorkbenchTab(): Rec {
 }
 
 function WorkbenchTabTitle(): Rec {
-  return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } },
-    h(Icon, { name: 'brush', size: 14, className: 'nai-tab-icon' }),
+  return h('span', { className: 'nai-tab-title' },
+    h(AtelierGlyph, { size: 14, className: 'nai-tab-icon' }),
     'NovelAI 生图工作台')
 }
 
@@ -70,9 +70,11 @@ function apply(ctx: ClientContext): void {
       kind: KIND,
       title: () => 'NovelAI 生图工作台',
       guide: [{
+        id: 'atelier',
         order: 30,
+        icon: AtelierGuideIcon,
         title: () => 'NovelAI 生图工作台',
-        description: () => 'NovelAI V5/V4.5 生图工作台：提示词、参考、队列、画廊、资料库与定时任务；生图协作请在 DSH 对话中使用 nai_* 工具。',
+        description: () => '提示词、参考、队列、画廊、资料库与定时任务。生成与编辑在对话中由 nai_* 工具完成。',
       }],
     })
     return asDispose(dispose)

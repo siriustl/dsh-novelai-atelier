@@ -14,6 +14,7 @@ import { Assets } from './assets.ts'
 import { Worker, JobNotSubmitted } from './worker.ts'
 import { prepareImage, PrepareImageRequestSchema } from '../core/preparation.ts'
 import { creativeDraft, fixedPrefix } from './schedulePlanner.ts'
+import { scheduleOutputSubdir } from './scheduleOutput.ts'
 import { defaultDraft } from './library.ts'
 import { specCatalog } from '../core/specs.ts'
 import { existsSync, readFileSync } from 'node:fs'
@@ -21,8 +22,9 @@ import { WorkspaceActions } from './workspaceActions.ts'
 import { Conversations } from './conversations.ts'
 import { composeSchedule } from './planSchedule.ts'
 import type { DshLlmBridge } from './dshLlm.ts'
+import { InspirationEngine } from './inspiration.ts'
 
-export const OPERATIONS = ['generate', 'img2img', 'inpaint', 'upscale', 'augment', 'enhance', 'encode_vibe', 'reference_generate'] as const
+export const OPERATIONS = ['generate', 'img2img', 'inpaint', 'outpaint', 'upscale', 'augment', 'enhance', 'encode_vibe', 'reference_generate'] as const
 export const MODELS = ['nai-diffusion-5-full', 'nai-diffusion-5-curated', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']
 
 import { VERSION } from '../version.ts'
@@ -65,6 +67,7 @@ export class Workbench {
   worker: Worker
   workspace: WorkspaceActions
   conversations: Conversations
+  inspiration: InspirationEngine
   hooks: WorkbenchHooks = {}
   maintenance = false
   /** Invalidates writes prepared against data replaced by a restore. */
@@ -89,6 +92,7 @@ export class Workbench {
     })
     this.executor = new OperationExecutor(
       {
+        target: (endpointId?: string) => this.settings.target(endpointId),
         token: () => this.settings.naiToken(),
         baseUrl: () => String(this.settings.raw()['nai_base_url']),
         proxy: () => (this.settings.raw()['proxy_url'] as string) || null,
@@ -101,6 +105,7 @@ export class Workbench {
     )
     this.workspace = new WorkspaceActions(this)
     this.conversations = new Conversations(this)
+    this.inspiration = new InspirationEngine(dir, () => (this.settings.raw()['proxy_url'] as string) || null)
     this.worker = new Worker(this.store, (job) => this.runJob(job), (run, signal) => this.planSchedule(run, signal))
     this.hooks.planSchedule = (run, signal) => composeSchedule(this, run, signal)
     this.pluginToken = ''
@@ -157,26 +162,99 @@ export class Workbench {
   stop(): void {
     this.conversations.shutdown()
     this.worker.stop()
+    void this.inspiration.close()
     this.workerStarted = false
   }
 
   client(context?: Rec): NovelAIClient {
     if (!context) {
       const current = this.settings.raw()
-      return new NovelAIClient({ token: this.settings.naiToken(), baseUrl: String(current['nai_base_url']), proxy: (current['proxy_url'] as string) || null,
+      let target: { baseUrl: string; token: string } | null = null
+      try { target = this.settings.target() } catch { target = null }
+      return new NovelAIClient({ token: target?.token ?? this.settings.naiToken(), baseUrl: target?.baseUrl ?? String(current['nai_base_url']), proxy: (current['proxy_url'] as string) || null,
         retryDelaySeconds: Number(current['retry_delay_seconds']), retryMaxAttempts: Number(current['retry_max_attempts']) })
     }
+    if (context['nai_secret']) {
+      return new NovelAIClient({
+        token: this.settings.secret(context['nai_secret'] as string),
+        baseUrl: String(context['nai_base_url']),
+        proxy: (context['proxy_url'] as string) || null,
+        retryDelaySeconds: Number(context['retry_delay_seconds'] ?? 3),
+        retryMaxAttempts: Number(context['retry_max_attempts'] ?? 3),
+      })
+    }
+    const frozen = this.settings.target(context['endpoint_id'] ? String(context['endpoint_id']) : undefined)
     return new NovelAIClient({
-      token: this.settings.secret(context['nai_secret'] as string),
-      baseUrl: String(context['nai_base_url']),
+      token: frozen.token,
+      baseUrl: frozen.baseUrl,
       proxy: (context['proxy_url'] as string) || null,
       retryDelaySeconds: Number(context['retry_delay_seconds'] ?? 3),
       retryMaxAttempts: Number(context['retry_max_attempts'] ?? 3),
     })
   }
 
-  async credits(): Promise<Rec> {
-    return await this.executor.credits() as unknown as Rec
+  async credits(endpointId?: string): Promise<Rec> {
+    return await this.executor.credits(undefined, endpointId) as unknown as Rec
+  }
+
+  /** Every enabled endpoint in one call; the header reads this to stay endpoint-aware. */
+  async creditsOverview(): Promise<Rec> {
+    const list = this.settings.endpoints().filter((item) => item['enabled'] !== false)
+    const rows = await Promise.all(list.map(async (item) => {
+      const id = String(item['id'])
+      const meta = {
+        id, name: item['name'], base_url: item['base_url'], official: item['official'] === true,
+        free_mode: item['free_mode'], v5_share: item['v5_share'], active: item['active'] === true,
+        subscription_note: item['subscription_note'], subscription_expires: item['subscription_expires'],
+        quota_kind: item['quota_kind'],
+      }
+      try {
+        return { ...meta, ok: true, credits: await this.credits(id), allowance: await this.endpointAllowance(id) }
+      } catch (error) {
+        return { ...meta, ok: false, error: (error as Error).message }
+      }
+    }))
+    const active = (rows.find((row) => row['active'] === true) ?? rows[0]) as Rec | undefined
+    const primary = (active?.['ok'] === true ? active['credits'] : {}) as Rec
+    return { ...primary, active_endpoint: active?.['id'] ?? '', endpoints: rows }
+  }
+
+  /**
+   * Read the allowance a gateway hides from its NAI-shaped API. The site session
+   * expires independently, so this is best-effort and never blocks generation.
+   */
+  async endpointAllowance(endpointId?: string): Promise<Rec | null> {
+    const target = this.settings.quotaTarget(endpointId)
+    if (!target) return null
+    try {
+      const response = await fetch(target.url, {
+        headers: { Authorization: `Bearer ${target.token}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000), redirect: 'manual',
+      })
+      if (!response.ok) return { ok: false, status: response.status, note: response.status === 401 ? '站点登录令牌已失效' : '额度接口返回错误' }
+      const envelope = await response.json() as Rec
+      // The site wraps every payload in { code, message, data }.
+      if (envelope['code'] != null && Number(envelope['code']) !== 200)
+        return { ok: false, status: response.status, note: String(envelope['message'] ?? '额度接口返回错误') }
+      const data = (envelope['data'] ?? envelope) as Rec
+      const allocation = (data['allocation'] ?? data) as Rec
+      const available = Number(allocation['available_images'] ?? NaN)
+      const capacity = Number(allocation['capacity_images'] ?? NaN)
+      const share = Number(allocation['share_count'] ?? (data['entitlement'] as Rec | undefined)?.['share_count'] ?? NaN)
+      if (!Number.isFinite(available) && !Number.isFinite(capacity))
+        return { ok: false, status: response.status, note: '额度接口返回的字段无法识别' }
+      return {
+        ok: true,
+        available_images: Number.isFinite(available) ? available : null,
+        capacity_images: Number.isFinite(capacity) ? capacity : null,
+        percent: Number.isFinite(available) && Number.isFinite(capacity) && capacity > 0
+          ? Math.round((Math.min(1, Math.max(0, available / capacity)) * 10000)) / 100 : null,
+        share_count: Number.isFinite(share) ? share : null,
+        reset_description: typeof data['reset_description'] === 'string' ? data['reset_description'] : null,
+      }
+    } catch (error) {
+      return { ok: false, note: (error as Error).name === 'TimeoutError' ? '额度接口超时' : '额度接口不可用' }
+    }
   }
 
   async validate(operation: string, request: Rec): Promise<Rec> {
@@ -348,11 +426,14 @@ export class Workbench {
     const epoch = this.restoreEpoch
     this.assertRestoreEpoch(epoch)
     const changes = structuredClone(data)
-    let merged = data
+    const suppliedRequest = changes['request']
+    if (!('output_subdir' in changes) && suppliedRequest instanceof Object && 'output_subdir' in suppliedRequest)
+      changes['output_subdir'] = suppliedRequest['output_subdir']
+    let merged = changes
     if (ident) {
       const current = this.store.listSchedules().find((s) => s['id'] === ident)
       if (!current) throw new Error('计划不存在')
-      merged = { ...current, ...data }
+      merged = { ...current, ...changes }
       if ('revision' in changes) changes['expected_revision'] = changes['revision']
     }
     let prepared = await this.prepareScheduleDataAsync(merged)
@@ -373,6 +454,7 @@ export class Workbench {
       data = structuredClone(data)
       // Identity and artist fragments belong to the frozen recipe, not the editable base request.
       data['request'] = structuredClone(normalized['request'])
+      data['output_subdir'] = normalized['output_subdir']
       data['snapshot'] = { ...(normalized['snapshot'] as Rec ?? {}), request: data['request'] }
     }
     return data
@@ -384,6 +466,9 @@ export class Workbench {
     const operation = (copy['operation'] ?? 'generate') as string
     if (!(OPERATIONS as readonly string[]).includes(operation)) throw new Error('定时计划需要选择生图或远程图像操作；本地画布准备请直接执行')
     const raw = normalizeRequest((copy['request'] ?? {}) as Rec)
+    copy['output_subdir'] = scheduleOutputSubdir({ ...copy, request: raw })
+    if (copy['output_subdir'] === null) delete raw['output_subdir']
+    else raw['output_subdir'] = copy['output_subdir']
     const ai = copy['execution_mode'] === 'ai'
     if (ai && !['generate', 'img2img', 'inpaint', 'enhance', 'reference_generate'].includes(operation))
       throw new Error('AI 计划需要支持提示词的操作；放大等操作可使用固定请求计划')
@@ -426,7 +511,7 @@ export class Workbench {
   }
 
   /** Register a direct tool generation (queue-bypassing) so it appears in the gallery. */
-  async registerDirectGeneration(result: Rec, request: unknown): Promise<void> {
+  async registerDirectGeneration(result: Rec, request: unknown): Promise<Rec | null> {
     const epoch = this.restoreEpoch
     try {
       this.assertRestoreEpoch(epoch)
@@ -441,9 +526,10 @@ export class Workbench {
       this.assertRestoreEpoch(epoch)
       const snapshot = { operation: String(result['operation'] ?? 'generate'), request: (request ?? {}) as Rec, library_refs: [] }
       const actual = result['anlas_spent']
-      this.store.recordDirectJob(snapshot, { ...result, assets }, typeof actual === 'number' && Number.isFinite(actual) ? actual : null)
+      return this.store.recordDirectJob(snapshot, { ...result, assets }, typeof actual === 'number' && Number.isFinite(actual) ? actual : null)
     } catch (error) {
       ;((result['warnings'] ??= []) as string[]).push(`图片或回执已保存，但画廊记录保存失败：${(error as Error).message}`)
+      return null
     }
   }
 

@@ -16,6 +16,51 @@ export class Raster {
 
   clone(): Raster { return new Raster(this.width, this.height, this.data.slice(), { ...this.info }) }
 
+  static blank(width: number, height: number, color: [number, number, number, number] = [255, 255, 255, 255]): Raster {
+    const data = new Uint8Array(width * height * 4)
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = color[0]!
+      data[i + 1] = color[1]!
+      data[i + 2] = color[2]!
+      data[i + 3] = color[3]!
+    }
+    return new Raster(width, height, data, { hasAlphaChannel: color[3] !== 255, transparencyMetadata: false })
+  }
+
+  blit(source: Raster, left: number, top: number): void {
+    const w = Math.min(source.width, this.width - left)
+    const h = Math.min(source.height, this.height - top)
+    if (w <= 0 || h <= 0) return
+    this.info.hasAlphaChannel ||= source.info.hasAlphaChannel
+    this.info.transparencyMetadata ||= source.info.transparencyMetadata
+    for (let y = 0; y < h; y++) {
+      const srcY = y
+      const dstY = top + y
+      if (dstY < 0 || dstY >= this.height) continue
+      const srcOffset = (srcY * source.width) * 4
+      const dstOffset = (dstY * this.width + Math.max(0, left)) * 4
+      const copyW = Math.min(w, this.width - Math.max(0, left))
+      this.data.set(source.data.subarray(srcOffset, srcOffset + copyW * 4), dstOffset)
+    }
+  }
+
+  fillRect(left: number, top: number, width: number, height: number, color: [number, number, number, number]): void {
+    const rLeft = Math.max(0, left)
+    const rTop = Math.max(0, top)
+    const rRight = Math.min(this.width, left + width)
+    const rBottom = Math.min(this.height, top + height)
+    if (rRight <= rLeft || rBottom <= rTop) return
+    for (let y = rTop; y < rBottom; y++) {
+      for (let x = rLeft; x < rRight; x++) {
+        const offset = (y * this.width + x) * 4
+        this.data[offset] = color[0]!
+        this.data[offset + 1] = color[1]!
+        this.data[offset + 2] = color[2]!
+        this.data[offset + 3] = color[3]!
+      }
+    }
+  }
+
   static fromDecoded(d: ReturnType<typeof decodePng>): Raster {
     return new Raster(d.width, d.height, d.data, { hasAlphaChannel: d.hasAlphaChannel, transparencyMetadata: d.transparencyMetadata, iccProfile: d.iccProfile, phys: d.phys })
   }

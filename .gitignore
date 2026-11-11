@@ -57,6 +57,7 @@ scripts/runtime-*.mjs
 .env.*
 *.local
 secrets/
+.warmup-hits.txt
 
 # OS and Editor files
 .DS_Store

@@ -1,6 +1,6 @@
 {
   "name": "dsh-novelai-atelier",
-  "version": "0.15.3",
+  "version": "0.19.4",
   "description": "NovelAI Atelier for DeepSeek Harness: NovelAI V5/V4.5 image generation tools + embedded workbench",
   "type": "module",
   "license": "MIT",
@@ -64,10 +64,10 @@
     "verify:ui": "node scripts/verify-ui.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/dsh-scope": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
-    "@deepseek-ai/schemastery": "~3.18.4"
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "dependencies": {
     "fflate": "^0.8.2",

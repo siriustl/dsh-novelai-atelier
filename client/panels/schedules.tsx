@@ -2,11 +2,12 @@
 import type { WorkbenchState } from '../shell.tsx'
 import { R, h, Button, Card, Field, Modal, ErrorBox, Empty, Select, Toggle, Num, keyboardActivate } from '../ui.tsx'
 import { api, assetThumb, type Rec } from '../api.ts'
+import { Icon } from '../icons.tsx'
 
 const EMPTY_PLAN = (): Rec => ({
   name: '定时生成', enabled: false, kind: 'daily', timezone: 'Asia/Shanghai', time: '09:00', at: '',
   interval_minutes: 60, operation: 'generate', count: 1, max_runs: 10, max_total_anlas: 0,
-  missed_policy: 'skip', execution_mode: 'ai', seed_mode: 'random',
+  missed_policy: 'skip', execution_mode: 'ai', seed_mode: 'random', output_subdir: null,
   request: { model: 'nai-diffusion-5-full', prompt: '', max_anlas: 0 },
   ai_recipe: { instruction: '', randomize: '', fixed_prompt: '', fixed_negative_prompt: '', library_refs: [], locked_fields: [] },
 })
@@ -140,46 +141,48 @@ export function SchedulesPanel({ state }: { state: WorkbenchState }): Rec {
             schedule['enabled']
               ? h('span', { className: 'nai-pill ok', style: { fontSize: 10, padding: '1px 7px' } }, '● 启用中')
               : h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 7px' } }, '○ 已停用'),
-            h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 7px' } },
-              schedule['execution_mode'] === 'ai' ? '🤖 AI 构思' : '📌 固定请求'),
+            h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 7px', display: 'inline-flex', alignItems: 'center', gap: 4 } },
+              h(Icon, { name: schedule['execution_mode'] === 'ai' ? 'sparkles' : 'sliders', size: 11 }),
+              schedule['execution_mode'] === 'ai' ? 'AI 构思' : '固定请求'),
             formatCountdown(schedule, nowSec),
           ),
           h('div', { style: { fontSize: 12, color: 'var(--nai-dim)' } },
             describeTiming(schedule),
-            ` · 每次 ${String(schedule['count'])} 张 · 进度 ${String(schedule['runs'])}/${String(schedule['max_runs'])} 轮`
+            ` · 每次 ${String(schedule['count'])} 张 · 进度 ${String(schedule['runs'])}/${String(schedule['max_runs'])} 轮`,
+            ('output_subdir' in schedule ? schedule['output_subdir'] : (schedule['request'] as Rec | undefined)?.['output_subdir'])
+              ? ` · ${String('output_subdir' in schedule ? schedule['output_subdir'] : (schedule['request'] as Rec)['output_subdir'])}` : '',
           ),
           h('div', { className: 'nai-row', style: { marginTop: 6, gap: 6 } },
             Button({
-              small: true, kind: schedule['enabled'] ? 'ghost' : 'primary',
+              small: true, icon: schedule['enabled'] ? 'pause' : 'play', kind: schedule['enabled'] ? 'ghost' : 'primary',
               onClick: (e: Rec) => { e.stopPropagation(); void toggle(schedule) },
               title: schedule['enabled'] ? '暂停此计划' : '启动此计划',
-            }, schedule['enabled'] ? '⏸ 暂停' : '▶ 启用'),
+            }, schedule['enabled'] ? '暂停' : '启用'),
             Button({
-              small: true,
+              small: true, icon: 'play',
               onClick: (e: Rec) => { e.stopPropagation(); void runOnce(schedule) },
               title: '立即触发一次此任务（加入队列）',
-            }, '⏱ 立即执行一次'),
+            }, '立即执行一次'),
             Button({
-              small: true, kind: 'ghost',
+              small: true, kind: 'ghost', icon: 'copy',
               onClick: (e: Rec) => { e.stopPropagation(); void copyPlan(schedule) },
               title: '复制生成新计划',
-            }, '⧉ 复制'),
+            }, '复制'),
             Button({
-              small: true, kind: 'ghost',
+              small: true, kind: 'ghost', icon: 'list',
               onClick: (e: Rec) => { e.stopPropagation(); void openRuns(schedule) },
               title: '查看运行日志',
-            }, '☰ 执行记录'),
+            }, '执行记录'),
             Button({
-              small: true, kind: 'ghost',
+              small: true, kind: 'ghost', icon: 'edit',
               onClick: (e: Rec) => { e.stopPropagation(); setEditing(structuredClone(schedule)) },
               title: '编辑任务配置',
-            }, '✎ 编辑'),
-            h('button', {
-              type: 'button', className: 'nai-icon-btn', 'aria-label': '删除定时计划',
+            }, '编辑'),
+            Button({
+              small: true, iconOnly: true, icon: 'trash', kind: 'ghost', className: 'danger',
               onClick: (e: Rec) => { e.stopPropagation(); void remove(schedule) },
               title: '删除任务',
-              style: { cursor: 'pointer', color: 'var(--nai-danger)', marginLeft: 6, padding: '2px 6px' },
-            }, '✕'),
+            }),
           ),
         ),
         firstAsset ? h('div', {
@@ -219,20 +222,21 @@ const OUTCOME_LABELS: Rec = {
 }
 
 function formatCountdown(schedule: Rec, now: number): Rec {
-  if (!schedule['enabled']) return h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 6px' } }, '⏸ 已停用')
+  if (!schedule['enabled']) return h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 6px' } }, '已停用')
   const next = schedule['next_run'] ? new Date(String(schedule['next_run'])).getTime() : null
   if (!next) return h('span', { className: 'nai-pill', style: { fontSize: 10, padding: '1px 6px' } }, '已达轮数上限')
   const diffSec = Math.floor((next - now) / 1000)
-  if (diffSec <= 0) return h('span', { className: 'nai-countdown', style: { color: 'var(--nai-ok)', borderColor: 'var(--nai-ok)' } }, '⏳ 触发队列中')
-  if (diffSec < 60) return h('span', { className: 'nai-countdown' }, `⏳ ${diffSec}秒后执行`)
+  const pillStyle = { display: 'inline-flex', alignItems: 'center', gap: 4 }
+  if (diffSec <= 0) return h('span', { className: 'nai-countdown', style: { color: 'var(--nai-ok)', borderColor: 'var(--nai-ok)', ...pillStyle } }, h(Icon, { name: 'clock', size: 10 }), '触发队列中')
+  if (diffSec < 60) return h('span', { className: 'nai-countdown', style: pillStyle }, h(Icon, { name: 'clock', size: 10 }), `${diffSec}秒后执行`)
   if (diffSec < 3600) {
     const m = Math.floor(diffSec / 60)
     const s = diffSec % 60
-    return h('span', { className: 'nai-countdown' }, `⏳ ${m}分${s}秒后执行`)
+    return h('span', { className: 'nai-countdown', style: pillStyle }, h(Icon, { name: 'clock', size: 10 }), `${m}分${s}秒后执行`)
   }
   const hVal = Math.floor(diffSec / 3600)
   const mVal = Math.floor((diffSec % 3600) / 60)
-  return h('span', { className: 'nai-countdown' }, `⏳ ${hVal}小时${mVal}分后执行`)
+  return h('span', { className: 'nai-countdown', style: pillStyle }, h(Icon, { name: 'clock', size: 10 }), `${hVal}小时${mVal}分后执行`)
 }
 
 function describeTiming(schedule: Rec): string {
@@ -329,6 +333,11 @@ function PlanEditor({ plan, onClose, onSaved, fail, guardNavigation }: { plan: R
         value: String(value['seed_mode'] ?? 'random'), onChange: (v: string) => set({ seed_mode: v }),
         options: [{ value: 'random', label: '随机' }, { value: 'increment', label: '递增' }, { value: 'fixed', label: '固定' }],
       })),
+      h(Field, { label: '分类子目录' }, h('input', {
+        value: String(('output_subdir' in value ? value['output_subdir'] : request['output_subdir']) ?? ''),
+        placeholder: '留空不分类', maxLength: 100,
+        onChange: (e: Rec) => set({ output_subdir: (e.target as HTMLInputElement).value || null }),
+      })),
       h(Toggle, { checked: Boolean(value['enabled']), onChange: (v: boolean) => set({ enabled: v }), label: '启用' }),
     ),
     h('div', { style: { height: 8 } }),
@@ -355,6 +364,7 @@ function PlanEditor({ plan, onClose, onSaved, fail, guardNavigation }: { plan: R
     Card({ title: '角色与画风引用（从资料库）' },
       h('div', { className: 'nai-row', style: { marginBottom: 6 } },
         Button({ small: true, onClick: () => { setLibKind('character'); setLibOpen(true) } }, '＋ 添加角色'),
+        Button({ small: true, onClick: () => { setLibKind('branch'); setLibOpen(true) } }, '＋ 添加角色分支'),
         Button({ small: true, onClick: () => { setLibKind('artist'); setLibOpen(true) } }, '＋ 添加画师/画风'),
         Button({ small: true, onClick: () => { setLibKind('blend'); setLibOpen(true) } }, '＋ 添加画师混合'),
         h('span', { style: { flex: 1 } }),
@@ -362,7 +372,7 @@ function PlanEditor({ plan, onClose, onSaved, fail, guardNavigation }: { plan: R
       selectedRefs.length ? h('div', { className: 'nai-tags' }, selectedRefs.map((refId) => {
         const item = libRows.find((r2) => r2['id'] === refId)
         return h('span', { className: 'nai-tag', key: refId },
-          `${item ? String(item['name']) : refId} (${item ? String(item['kind']) : '资料'}) `,
+          `${item ? (item['kind'] === 'branch' && item['parent_name'] ? `${String(item['parent_name'])} · ${String(item['name'])}` : String(item['name'])) : refId} (${item ? String(item['kind']) : '资料'}) `,
           Button({
             small: true, icon: 'close', kind: 'ghost',
             title: value['execution_mode'] === 'ai' ? '移除此资料绑定；手写固定片段保持不变' : '仅移除来源标签；已应用的固定提示词和角色保持不变',
@@ -414,7 +424,7 @@ function PlanEditor({ plan, onClose, onSaved, fail, guardNavigation }: { plan: R
       h('div', { className: 'nai-row', style: { marginBottom: 10 } },
         Select({
           value: libKind, onChange: setLibKind,
-          options: [{ value: '', label: '全部' }, { value: 'character', label: '角色' }, { value: 'artist', label: '画师' }, { value: 'blend', label: '混合' }, { value: 'preset', label: '预设' }],
+          options: [{ value: '', label: '全部' }, { value: 'character', label: '角色' }, { value: 'branch', label: '角色分支' }, { value: 'artist', label: '画师' }, { value: 'blend', label: '混合' }, { value: 'preset', label: '预设' }],
         }),
       ),
       h('div', { className: 'nai-list' }, libRows.filter((r3) => !libKind || r3['kind'] === libKind).map((r3) => h('div', {
@@ -423,7 +433,7 @@ function PlanEditor({ plan, onClose, onSaved, fail, guardNavigation }: { plan: R
         onClick: () => void addLibraryRef(r3),
       },
         h('div', { className: 'grow' },
-          h('strong', null, String(r3['name'])),
+          h('strong', null, r3['kind'] === 'branch' && r3['parent_name'] ? `${String(r3['parent_name'])} · ${String(r3['name'])}` : String(r3['name'])),
           h('span', { className: 'nai-tag', style: { marginLeft: 6 } }, String(r3['kind'])),
           h('div', { className: 'sub' }, String((r3['data'] as Rec)?.['prompt'] ?? '').slice(0, 80)),
         ),
