@@ -41,7 +41,7 @@
 
 Node.js 与 pnpm 需安装并加入 PATH。依赖版本约束见 `package.json`。
 
-`typecheck`、`test`、`build`（`& $node $pnpm run <script>`）；`verify:package`、`verify:ui`（后者支持 `--smoke`，报告写 `.nai-verification/<版本>/`）。`verify:package` 与 `verify:ui` 需要先 `build`。
+`typecheck`、`test`、`build`（`pnpm run <script>`）；`verify:package`、`verify:ui`（后者支持 `--smoke`，报告写 `.nai-verification/<版本>/`）。`verify:package` 与 `verify:ui` 需要先 `build`。
 
 ## 验证梯度
 
