@@ -1,0 +1,630 @@
+/** Workbench HTTP API for the embedded Web GUI panel. */
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { relative as relativePath, isAbsolute } from 'node:path'
+import { Workbench, guide, presets, publicJob } from './app.ts'
+import type { Rec } from './store.ts'
+import { parseMultipart } from './multipart.ts'
+import { searchTags, translateTags, loadTagCatalog, normalizeTag, type TagEntry } from './tags.ts'
+import { cleanPngMetadata } from '../core/png.ts'
+
+export interface WebDeps {
+  workbench: Workbench
+  checkRequest: (req: IncomingMessage) => Promise<boolean>
+}
+
+const JSON_BODY_LIMIT = 2 * 1024 * 1024
+
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
+    const fail = (error: Error): void => {
+      if (settled) return
+      settled = true
+      chunks.length = 0
+      reject(error)
+    }
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return
+      size += chunk.length
+      if (size > limit) { fail(new HttpStatus(413, '上传内容过大')); return }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks))
+    })
+    req.on('aborted', () => fail(new HttpStatus(400, '请求已中止')))
+    req.on('error', fail)
+  })
+}
+
+class HttpStatus extends Error {
+  constructor(readonly status: number, message: string) { super(message) }
+}
+
+function json(res: ServerResponse, status: number, value: unknown): boolean {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  res.end(Buffer.from(JSON.stringify(value), 'utf8'))
+  return true
+}
+
+function sendFile(res: ServerResponse, data: Uint8Array, mime: string, download?: string): void {
+  res.writeHead(200, {
+    'Content-Type': mime,
+    'Cache-Control': 'private, max-age=3600',
+    'X-Content-Type-Options': 'nosniff',
+    ...(download ? { 'Content-Disposition': `attachment; filename="${download}"` } : {}),
+  })
+  res.end(data)
+}
+
+function imageMime(data: Uint8Array): string {
+  if (data[0] === 0x89 && data[1] === 0x50) return 'image/png'
+  if (data[0] === 0xff && data[1] === 0xd8) return 'image/jpeg'
+  if (data.length > 12 && Buffer.from(data.subarray(0, 4)).toString('latin1') === 'RIFF') return 'image/webp'
+  return 'application/octet-stream'
+}
+
+const fs = () => import('node:fs')
+
+async function withRequestSignal<T>(res: ServerResponse, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController()
+  const closed = () => { if (!res.writableEnded) controller.abort() }
+  res.once('close', closed)
+  try { return await action(controller.signal) } finally { res.off('close', closed) }
+}
+
+async function readRegisteredPng(wb: Workbench, path: string): Promise<Buffer> {
+  const fsp = await import('node:fs/promises')
+  const target = await fsp.realpath(path)
+  const assetRoot = await fsp.realpath(wb.assets.directory)
+  const canonical = async (file: unknown): Promise<string | null> => {
+    if (typeof file !== 'string') return null
+    try { return await fsp.realpath(file) } catch { return null }
+  }
+  const localAssets = await Promise.all(wb.store.listAssets().map(async (asset) => {
+    const file = await canonical(asset['path'])
+    if (!file) return null
+    const relative = relativePath(assetRoot, file)
+    return relative.startsWith('..') || isAbsolute(relative) ? null : file
+  }))
+  const outputs = wb.store.listJobs(10000).flatMap((job) => {
+    const files = (job['result'] as Rec | null)?.['artifact_paths']
+    return Array.isArray(files) ? files : []
+  })
+  const registered = localAssets.includes(target) || (await Promise.all(outputs.map(canonical))).includes(target)
+  if (!registered) throw new HttpStatus(403, '只允许清洗工作台已登记的素材与作品')
+  const stat = await fsp.stat(target)
+  if (!stat.isFile()) throw new HttpStatus(400, '请选择 PNG 图片')
+  if (stat.size > 48 * 1024 * 1024) throw new HttpStatus(413, '图片超过 48 MiB')
+  const data = await fsp.readFile(target)
+  if (data.length > 48 * 1024 * 1024) throw new HttpStatus(413, '图片超过 48 MiB')
+  if (imageMime(data) !== 'image/png') throw new HttpStatus(400, '脱敏下载仅支持 PNG 原图')
+  return data
+}
+
+export function createApiHandler(deps: WebDeps): (req: IncomingMessage, res: ServerResponse, pathname: string) => Promise<boolean> {
+  const wb = deps.workbench
+
+  return async function handle(req, res, pathname): Promise<boolean> {
+    const url = new URL(req.url ?? '/', 'http://local')
+    const relative = url.pathname.startsWith(pathname) ? url.pathname.slice(pathname.length) : url.pathname
+    const path = relative.replace(/^\/api\/?/u, '').replace(/\/+$/u, '')
+    const pieces = path.split('/')
+    const method = (req.method ?? 'GET').toUpperCase()
+    const epoch = wb.restoreEpoch
+    const readOnly = method === 'GET' || method === 'HEAD' || (method === 'POST' && (
+      ['validate', 'quote', 'inspect', 'recover', 'library/export', 'library/preview',
+        'library/import-preview', 'gallery/export', 'gallery/clean-export', 'gallery/clean-image', 'tags/translate', 'backups/preview', 'settings/test'].includes(path)
+    ))
+    const q = (name: string) => url.searchParams.get(name)
+    const ok = (value: unknown) => json(res, 200, value)
+
+    try {
+      if (wb.maintenance) return json(res, 503, { error: '工作台正在恢复备份，请稍后刷新' })
+      if (!(await deps.checkRequest(req))) return json(res, 403, { error: '未授权的请求' })
+
+      // ---- body parsing (JSON unless multipart) ----
+      let body: Rec = {}
+      const contentType = String(req.headers['content-type'] ?? '')
+      if (['POST', 'PUT', 'PATCH'].includes(method)) {
+        const raw = await readBody(req, path.startsWith('backups') ? 1024 * 1024 * 1024 + 1024 * 1024
+          : path === 'assets' || path.includes('library/import') ? 128 * 1024 * 1024 + 1024 : JSON_BODY_LIMIT)
+        if (contentType.includes('multipart/form-data')) {
+          const parts = parseMultipart(raw, contentType)
+          const file = parts.get('file')
+          if (!file) throw new Error('请选择文件')
+          ;(req as IncomingMessage & { __file__?: { data: Uint8Array; filename: string; fields: Rec } }).__file__ = {
+            data: file.data,
+            filename: file.filename ?? 'upload.bin',
+            fields: Object.fromEntries([...parts.entries()].filter(([k]) => k !== 'file').map(([k, v]) => [k, Buffer.from(v.data).toString('utf8')])),
+          }
+        } else if (raw.length) {
+          try { body = JSON.parse(raw.toString('utf8')) as Rec } catch { throw new HttpStatus(400, '无效 JSON') }
+          if (!(body instanceof Object) || Array.isArray(body)) throw new HttpStatus(400, '请求必须是 JSON 对象')
+        }
+      }
+      if (!readOnly) wb.assertRestoreEpoch(epoch)
+      const upload = () => (req as IncomingMessage & { __file__?: { data: Uint8Array; filename: string; fields: Rec } }).__file__!
+
+      // ---- file routes (no JSON envelope) ----
+      if (path.startsWith('files/')) {
+        if (method !== 'GET' && method !== 'HEAD') throw new HttpStatus(405, '需要 GET')
+        let target: string
+        try { target = decodeURIComponent(path.slice('files/'.length)) } catch { throw new HttpStatus(400, '无效文件路径') }
+        const { readFileSync, existsSync, statSync, realpathSync } = await fs()
+        const assetRoot = realpathSync(wb.assets.directory)
+        const known = wb.store.listAssets().map((asset) => String(asset['path'])).filter((file) => {
+          try { const rel = relativePath(assetRoot, realpathSync(file)); return !rel.startsWith('..') && !isAbsolute(rel) } catch { return false }
+        })
+        for (const job of wb.store.listJobs(10000)) {
+          const result = job['result'] as Rec | null
+          for (const file of (result?.['artifact_paths'] ?? []) as unknown[]) {
+            if (typeof file === 'string') known.push(file)
+          }
+        }
+        if (!existsSync(target)) throw new HttpStatus(404, '文件不存在')
+        const canonical = realpathSync(target)
+        if (!known.some((file) => { try { return realpathSync(file) === canonical } catch { return false } })) {
+          throw new HttpStatus(403, '只允许读取工作台已登记的素材与作品')
+        }
+        const stat = statSync(canonical)
+        if (!stat.isFile()) throw new HttpStatus(404, '文件不存在')
+        if (stat.size > 64 * 1024 * 1024) throw new HttpStatus(413, '文件过大')
+        const data = readFileSync(canonical)
+        sendFile(res, method === 'HEAD' ? new Uint8Array(0) : data, imageMime(data))
+        return true
+      }
+
+      // ---- events (SSE) ----
+      if (path === 'events' && method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' })
+        const timer = setInterval(() => {
+          try {
+            const data = { jobs: wb.store.listJobs().length, paused: wb.store.getPaused() }
+            res.write(`event: update\ndata: ${JSON.stringify(data)}\n\n`)
+          } catch { clearInterval(timer) }
+        }, 3000)
+        timer.unref?.()
+        req.on('close', () => clearInterval(timer))
+        return true
+      }
+
+      // ---- core ----
+      if (path === 'bootstrap' && method === 'GET') return ok(wb.bootstrap(q('compact') === 'true'))
+      if (path === 'draft' && method === 'GET') return ok(wb.store.getDraft())
+      if (path === 'draft' && method === 'PUT') return ok(wb.store.saveDraft(body, body['revision'] as number))
+      if (path === 'draft' && method === 'PATCH') return ok(wb.store.saveDraft(body, (body['base_revision'] ?? body['revision']) as number))
+      if (path === 'draft/reset' && method === 'POST') return ok(wb.resetDraft(body['revision'] as number, (body['draft_id'] as string) ?? null))
+      if (path === 'settings' && method === 'GET') return ok(wb.settings.public())
+      if (path === 'settings' && method === 'PUT') return ok(wb.settings.save(body))
+      if (path === 'settings/test' && method === 'POST') return ok(await testConnection(wb, body))
+      if (path === 'credits' && method === 'GET') return ok(await wb.creditsOverview())
+      if (path === 'schema' && method === 'GET') {
+        const operation = q('operation') ?? 'generate'
+        const described = (await import('./describe.ts')).describeOperation() as Rec
+        const schema = (described['operations'] as Rec)[operation]
+        if (!schema) throw new Error('未知操作')
+        return ok(schema)
+      }
+      if (path === 'presets' && method === 'GET') return ok(presets(q('model') ?? 'nai-diffusion-5-full'))
+      if (path === 'guide' && method === 'GET') return ok({ text: guide(q('topic') ?? 'overview') })
+      if (path === 'tags' && method === 'GET') {
+        const query = q('query') ?? ''
+        if (query.length < 2 || query.length > 60) throw new Error('请输入 2–60 字符的标签片段')
+        const tags = await wb.executor.suggestTags(query, q('model') ?? 'nai-diffusion-5-full', (q('language') as 'en' | 'jp') ?? 'en')
+        return ok({ tags })
+      }
+      if (path === 'tags/suggest' && method === 'GET') {
+        const query = q('query') ?? q('q') ?? ''
+        const limit = Number(q('limit')) || 15
+        const localSuggestions = searchTags(query, limit, wb.assets.directory)
+        if (/^[a-zA-Z0-9_\s-]+$/.test(query.trim()) && query.trim().length >= 1) {
+          try {
+            const remote = await wb.executor.suggestTags(query.trim(), 'nai-diffusion-5-full', 'en').catch(() => [])
+            const catalog = loadTagCatalog(wb.assets.directory)
+            const lookup = new Map<string, TagEntry>()
+            for (const item of catalog) lookup.set(normalizeTag(item.name), item)
+            const names = new Set(localSuggestions.map((s) => s.name))
+            for (const r of remote) {
+              const tag = r.tag
+              if (!names.has(tag)) {
+                const found = lookup.get(normalizeTag(tag))
+                localSuggestions.push({
+                  name: tag,
+                  zh: found?.zh || r.japanese || '',
+                  category: found?.category || 'general',
+                  count: r.count || 0,
+                  matchType: 'prefix',
+                })
+                names.add(tag)
+              }
+              if (localSuggestions.length >= limit * 2) break
+            }
+          } catch {}
+        }
+        return ok({ suggestions: localSuggestions.slice(0, limit) })
+      }
+      if (path === 'tags/translate' && method === 'POST') {
+        const tags = Array.isArray(body['tags']) ? body['tags'].map(String) : []
+        return ok({ translations: translateTags(tags, wb.assets.directory) })
+      }
+      if (path === 'inspiration/search' && method === 'GET') {
+        const query = q('query') ?? q('q') ?? ''
+        const source = (q('source') as 'all' | 'danbooru' | 'pixiv' | 'aitag') || 'all'
+        const limit = Number(q('limit') ?? 24)
+        const page = Number(q('page') ?? 1)
+        const pixivAi = q('pixivAi')
+        if (pixivAi !== null && pixivAi !== 'all' && pixivAi !== 'exclude') throw new HttpStatus(400, 'Pixiv AI 标记筛选无效')
+        if (!Number.isInteger(limit) || limit < 1 || limit > 50 || !Number.isInteger(page) || page < 1 || page > 1000)
+          throw new HttpStatus(400, '分页参数无效')
+        return ok(await withRequestSignal(res, (signal) => wb.inspiration.search({ query, source, limit, page, signal, ...(pixivAi ? { pixivAi } : {}) })))
+      }
+      if (path === 'inspiration/detail' && method === 'GET') {
+        const source = q('source') as 'danbooru' | 'pixiv' | 'aitag'
+        const id = q('id') ?? ''
+        return ok(await withRequestSignal(res, (signal) => wb.inspiration.detail({ source, id, signal })))
+      }
+      if (path === 'inspiration/image' && method === 'GET') {
+        const rawUrl = q('url') ?? ''
+        if (!rawUrl) return json(res, 400, { error: 'url required' })
+        let parsed: URL
+        try { parsed = new URL(rawUrl) } catch { throw new HttpStatus(400, 'Invalid image URL') }
+        const allowedHosts = new Set(['cdn.donmai.us', 'i.pximg.net', 's.pximg.net', 'ai-img.10118899.xyz'])
+        if (parsed.protocol !== 'https:' || parsed.port || parsed.username || parsed.password || !allowedHosts.has(parsed.hostname.toLowerCase()))
+          throw new HttpStatus(403, 'Image URL not allowed')
+        try {
+          const img = await withRequestSignal(res, (signal) => wb.inspiration.fetchImage(rawUrl, signal))
+          res.writeHead(200, {
+            'Content-Type': img.contentType,
+            'Content-Length': img.buffer.length,
+            'Cache-Control': 'private, max-age=86400',
+            'X-Content-Type-Options': 'nosniff',
+          })
+          res.end(img.buffer)
+          return true
+        } catch (e) {
+          return json(res, 502, { error: (e as Error).message })
+        }
+      }
+      if ((path === 'validate' || path === 'quote') && method === 'POST') {
+        const endpointId = typeof body['endpoint_id'] === 'string' && body['endpoint_id'].trim()
+          ? body['endpoint_id'].trim()
+          : typeof body['endpoint'] === 'string' && body['endpoint'].trim()
+            ? body['endpoint'].trim()
+            : undefined
+        return ok(path === 'validate'
+          ? await wb.validate(String(body['operation'] ?? 'generate'), body['request'] as Rec)
+          : await wb.quote(String(body['operation'] ?? 'generate'), body['request'] as Rec, endpointId))
+      }
+      if (path === 'library/export' && method === 'GET') {
+        const data = wb.assets.exportLibrary(null)
+        sendFile(res, data, 'application/zip', 'atelier-library.zip')
+        return true
+      }
+      if (path === 'library/export' && method === 'POST') {
+        const data = wb.assets.exportLibrary((body['ids'] ?? null) as string[] | null)
+        sendFile(res, data, 'application/zip', 'atelier-library.zip')
+        return true
+      }
+      if (path === 'assets' && method === 'POST') {
+        const file = upload()
+        return ok(await wb.assets.add(file.data, file.filename))
+      }
+      if ((path === 'library/import' || path === 'library/import-preview' || path === 'library/import-merge') && method === 'POST') {
+        const file = upload()
+        const fields = file.fields ?? {}
+        return ok(await wb.assets.importLibrary(file.data, {
+          preview: path.endsWith('preview'),
+          choices: fields['choices'] ? JSON.parse(String(fields['choices'])) as Rec : null,
+          expectedRevisions: fields['expected_revisions'] ? JSON.parse(String(fields['expected_revisions'])) as Rec : null,
+        }))
+      }
+      if (path === 'library' && method === 'GET') return ok(wb.store.listEntries(q('query') ?? '', q('kind') || null))
+      if (path === 'library' && method === 'POST') return ok(wb.store.saveEntry(body))
+      if (path === 'library/query' && method === 'GET') {
+        return ok(wb.store.queryEntries({
+          query: q('query') ?? '', kind: q('kind') || null, tag: q('tag') || null,
+          favorite: q('favorite') === 'true', sort: q('sort') || 'updated',
+          offset: q('offset') === null ? 0 : Number(q('offset')),
+          limit: q('limit') === null ? undefined : Number(q('limit')),
+        }))
+      }
+      if (pieces[0] === 'library' && pieces.length === 3 && method === 'POST') {
+        if (pieces[2] === 'use') { wb.store.recordEntryUse(pieces[1]!); return ok({ recorded: true }) }
+        if (pieces[2] === 'favorite') {
+          if (typeof body['favorite'] !== 'boolean') throw new Error('favorite 必须是布尔值')
+          return ok(wb.store.setEntryFavorite(pieces[1]!, body['favorite'], (body['revision'] as number) ?? null))
+        }
+      }
+      if (pieces[0] === 'library' && pieces.length === 2) {
+        if (method === 'PUT') return ok(wb.store.saveEntry(body, pieces[1], (body['revision'] as number) ?? null))
+        if (method === 'DELETE') { wb.store.deleteEntry(pieces[1]!, q('revision') === null ? null : Number(q('revision'))); return ok({ deleted: true }) }
+        if (method === 'GET') return ok(wb.store.getEntry(pieces[1]!))
+      }
+      if (path === 'library/preview' && method === 'POST') {
+        const { entryPrompt } = await import('./library.ts')
+        const entry = wb.store.getEntry(String(body['entry_id']))
+        const { prompt, negative } = entryPrompt(entry, wb.store.listEntries(), Number(body['prompt_set'] ?? -1))
+        return ok({
+          entry, prompt, negative_prompt: negative,
+          inherits_parent: entry['kind'] === 'branch' && !((entry['data'] as Rec)['replace_identity']),
+        })
+      }
+      if (path === 'assets' && method === 'GET') return ok(wb.store.listAssets())
+      if (pieces[0] === 'assets' && pieces.length === 3 && method === 'GET') {
+        const asset = wb.store.getAsset(pieces[1]!)
+        if (pieces[2] === 'file') {
+          const { readFileSync, realpathSync } = await fs()
+          const target = realpathSync(String(asset['path']))
+          const rel = relativePath(realpathSync(wb.assets.directory), target)
+          if (rel.startsWith('..') || isAbsolute(rel)) throw new HttpStatus(403, '素材路径超出工作台目录')
+          const data = readFileSync(target)
+          sendFile(res, data, String(asset['mime'] ?? imageMime(data)))
+          return true
+        }
+        if (pieces[2] === 'thumb') {
+          sendFile(res, await wb.assets.thumbnail(pieces[1]!), 'image/png')
+          return true
+        }
+      }
+      if (path === 'inspect' && method === 'POST') {
+        const { inspectImage } = await import('../core/metadata.ts')
+        return ok(inspectImage(String(wb.store.getAsset(String(body['asset_id']))['path'])))
+      }
+      if (path === 'recover' && method === 'POST') {
+        const { recoverRequest } = await import('../core/recovery.ts')
+        const source = body['asset_id'] ? String(wb.store.getAsset(String(body['asset_id']))['path']) : String(body['record_path'])
+        return ok(await recoverRequest(source))
+      }
+      if (path === 'prepare' && method === 'POST') return ok(await wb.prepare(body))
+      if (path === 'jobs/pause' && method === 'POST') {
+        if (typeof body['paused'] !== 'boolean') throw new Error('paused 必须是布尔值')
+        wb.store.setPaused(body['paused'])
+        return ok({ paused: wb.store.getPaused() })
+      }
+      if (path === 'jobs' && method === 'GET') return ok(wb.jobs())
+      if (path === 'jobs' && method === 'POST') return ok(await wb.submitJobs(body, (req.headers['idempotency-key'] as string) ?? null))
+      if (pieces[0] === 'jobs' && pieces.length >= 2) {
+        if (pieces.length === 2 && method === 'GET') return ok(publicJob(wb.store.getJob(pieces[1]!)))
+        if (pieces.length === 3 && pieces[2] === 'cancel' && method === 'POST') return ok(publicJob(wb.store.cancelJob(pieces[1]!)))
+        if (pieces.length === 3 && pieces[2] === 'favorite' && method === 'POST') {
+          if (typeof body['favorite'] !== 'boolean') throw new Error('favorite 必须是布尔值')
+          return ok(publicJob(wb.store.updateJob(pieces[1]!, { favorite: body['favorite'] })))
+        }
+      }
+      // ---- schedules (bridged to DSH native ctx.schedule + legacy migration) ----
+      if (path === 'schedules' && method === 'GET') {
+        return ok(await wb.listDshSchedules({ all: q('all') === 'true' }))
+      }
+      if (path === 'schedules' && method === 'POST') {
+        return ok(await wb.createDshSchedule(body))
+      }
+      if (pieces[0] === 'schedules' && pieces[1] === 'legacy' && pieces.length >= 3) {
+        const legacyId = pieces[2]!
+        if (pieces.length === 4 && pieces[3] === 'migrate' && method === 'POST') {
+          return ok(await wb.migrateLegacySchedule(legacyId, { deleteLegacy: body['delete_legacy'] !== false }))
+        }
+        if (pieces.length === 3 && method === 'DELETE') {
+          wb.store.deleteSchedule(legacyId, q('revision') === null ? null : Number(q('revision')))
+          return ok({ deleted: true, id: legacyId })
+        }
+      }
+      if (pieces[0] === 'schedules' && pieces.length === 3) {
+        if (pieces[2] === 'history' && method === 'GET') {
+          return ok(await wb.historyDshSchedule(pieces[1]!, Number(q('limit') ?? 20)))
+        }
+        if (pieces[2] === 'run' && method === 'POST') {
+          return ok(await wb.runDshSchedule(pieces[1]!))
+        }
+      }
+      if (pieces[0] === 'schedules' && pieces.length === 2) {
+        if (method === 'GET') return ok(await wb.viewDshSchedule(pieces[1]!))
+        if (method === 'PUT') return ok(await wb.editDshSchedule(pieces[1]!, body))
+        if (method === 'DELETE') {
+          return ok(await wb.deleteDshSchedule(pieces[1]!, q('expected_updated_at') ?? undefined))
+        }
+      }
+
+      // ---- drafts (creative_api) ----
+      if (path === 'drafts' && method === 'GET') return ok(wb.store.listDrafts())
+      if (path === 'drafts' && method === 'POST') return ok(wb.store.createDraft((body['draft'] ?? null) as Rec, body['activate'] !== false))
+      if (pieces[0] === 'drafts' && pieces.length >= 2) {
+        const ident = pieces[1]!
+        if (pieces.length === 2) {
+          if (method === 'GET') return ok(wb.store.getDraft(ident))
+          if (method === 'DELETE') return ok(wb.store.deleteDraft(ident, Number(q('revision'))))
+          if (method === 'PUT') return ok(wb.store.saveDraft({ ...body, id: ident }, body['revision'] as number))
+        }
+        if (pieces.length === 3 && pieces[2] === 'activate' && method === 'POST') return ok(wb.store.switchDraft(ident))
+        if (pieces.length === 3 && pieces[2] === 'versions') {
+          if (method === 'GET') return ok(wb.store.listVersions(ident))
+          if (method === 'POST') return ok(wb.store.saveVersion(ident, String(body['name']), body['revision'] as number))
+        }
+      }
+      // ---- gallery ----
+      if (path === 'gallery' && method === 'GET') {
+        const result = wb.store.queryJobs({
+          query: q('query') ?? '', offset: Number(q('offset') ?? 0), limit: Number(q('limit') ?? 48),
+          model: q('model') ?? '', scheduleId: q('schedule_id') ?? '',
+          characterId: q('character_id') ?? '', artistId: q('artist_id') ?? '',
+          favorite: q('favorite') === 'true', archived: q('archived') === 'true', status: q('status') ?? '',
+          after: q('after') ?? '', before: q('before') ?? '',
+        }) as Rec
+        return ok({ ...result, items: (result['items'] as Rec[]).map(publicJob) })
+      }
+      if (path === 'gallery/reveal' && method === 'POST') {
+        const { revealArtwork } = await import('./reveal.ts')
+        return ok(await revealArtwork(wb, body['job_id'], body['asset_id'], undefined, { select: Boolean(body['select']) }))
+      }
+      if (path === 'gallery/curate' && method === 'POST') return ok(wb.store.curateJobs(body['ids'] as string[], {
+        favorite: (body['favorite'] as boolean | null) ?? null, archived: (body['archived'] as boolean | null) ?? null,
+      }))
+      if (path === 'gallery/export' && method === 'POST') {
+        const ids = body['ids']
+        if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || !ids.every((v) => typeof v === 'string')) {
+          throw new Error('请选择 1–500 条作品记录')
+        }
+        const { zipSync, strToU8 } = await import('fflate')
+        const fsp = await import('node:fs/promises')
+        const records: Rec[] = []
+        const seen = new Set<string>()
+        const imageMembers = new Map<string, string>()
+        const images: Record<string, Uint8Array> = {}
+        let expandedBytes = 0
+        for (const id of ids as string[]) {
+          const job = publicJob(wb.store.getJob(id)) as Rec
+          for (const asset of (job['assets'] ?? []) as Rec[]) {
+            if (typeof asset['id'] === 'string' && typeof asset['path'] === 'string') {
+              if (!/^[A-Za-z0-9_-]{1,128}$/u.test(asset['id'])) throw new Error('作品素材 ID 无效')
+              const suffix = asset['path'].slice(asset['path'].lastIndexOf('.')).toLowerCase()
+              if (!/^\.(?:png|jpe?g|webp|vibe|naiv4vibe)$/u.test(suffix)) throw new Error('作品素材格式无效')
+              const member = 'images/' + asset['id'] + suffix
+              imageMembers.set(asset['path'], member)
+              if (seen.has(asset['id'])) continue
+              seen.add(asset['id'])
+              const size = (await fsp.stat(asset['path'])).size
+              expandedBytes += size
+              if (size > 48 * 1024 * 1024 || expandedBytes > 128 * 1024 * 1024) throw new HttpStatus(413, '作品包超过大小限制，请分批导出')
+              const bytes = await fsp.readFile(asset['path'])
+              if (bytes.length > size || bytes.length > 48 * 1024 * 1024) throw new HttpStatus(413, '作品文件在导出期间变大，请重试')
+              images[member] = new Uint8Array(bytes)
+            }
+          }
+          records.push(job)
+        }
+        const shared = records.map((record) => artworkShareValue(record, imageMembers))
+        const notice = 'NovelAI Atelier artwork export\n\n' +
+          'records.json omits private connection settings, credentials, and local file paths.\n' +
+          'Original artwork bytes are preserved. PNG text and hidden alpha metadata may contain prompts, seeds, and other private information.\n' +
+          'This package is not anonymized. Review the records and image metadata before sharing.\n'
+        const zipped = zipSync({ ...images, 'records.json': strToU8(JSON.stringify(shared, null, 2)), 'README.txt': strToU8(notice) })
+        sendFile(res, zipped, 'application/zip', 'atelier-artworks.zip')
+        return true
+      }
+      if (path === 'gallery/clean-export' && method === 'POST') {
+        const ids = body['ids']
+        if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || !ids.every((v) => typeof v === 'string')) {
+          throw new Error('请选择 1–500 条作品记录')
+        }
+        const cleanMode = (body['mode'] === 'prompts' ? 'prompts' : 'all') as 'all' | 'prompts'
+        const customText = typeof body['custom_text'] === 'string' ? body['custom_text'] : undefined
+        const { zipSync } = await import('fflate')
+        const images: Record<string, Uint8Array> = {}
+        let expandedBytes = 0
+        for (const id of [...new Set(ids as string[])]) {
+          const job = publicJob(wb.store.getJob(id)) as Rec
+          for (const asset of ((job['assets'] ?? []) as Rec[])) {
+            if (typeof asset['path'] === 'string' && asset['path'].toLowerCase().endsWith('.png')) {
+              const raw = await readRegisteredPng(wb, asset['path'])
+              expandedBytes += raw.length
+              if (expandedBytes > 128 * 1024 * 1024) throw new HttpStatus(413, '作品包超过大小限制，请分批导出')
+              const cleaned = cleanPngMetadata(raw, { mode: cleanMode, customText })
+              const name = `artwork-${Object.keys(images).length + 1}.png`
+              images[name] = cleaned
+            }
+          }
+        }
+        if (!Object.keys(images).length) throw new HttpStatus(400, '所选作品没有可脱敏的 PNG 原图')
+        const zipped = zipSync(images)
+        sendFile(res, zipped, 'application/zip', 'atelier-cleaned-artworks.zip')
+        return true
+      }
+      if (path === 'gallery/clean-image' && method === 'POST') {
+        const cleanMode = (body['mode'] === 'prompts' ? 'prompts' : 'all') as 'all' | 'prompts'
+        const customText = typeof body['custom_text'] === 'string' ? body['custom_text'] : undefined
+        let targetPath: string | null = null
+        if (body['asset_id']) {
+          const asset = wb.store.getAsset(String(body['asset_id']))
+          targetPath = String(asset['path'])
+        } else if (body['path']) {
+          targetPath = String(body['path'])
+        }
+        if (!targetPath) throw new HttpStatus(400, '缺少图片路径或 asset_id')
+        const raw = await readRegisteredPng(wb, targetPath)
+        const cleaned = cleanPngMetadata(raw, { mode: cleanMode, customText })
+        sendFile(res, cleaned, 'image/png')
+        return true
+      }
+
+      // ---- backups（整库快照：凭据脱敏导出、预览、原子恢复） ----
+      if (path === 'backups/export' && method === 'GET') {
+        const { Backup } = await import('./backup.ts')
+        const result = new Backup(wb).export()
+        const fsp = await import('node:fs/promises')
+        const name = result.path.slice(result.path.lastIndexOf('\\') + 1).slice(result.path.lastIndexOf('/') + 1)
+        sendFile(res, new Uint8Array(await fsp.readFile(result.path)), 'application/zip', name)
+        return true
+      }
+      if ((path === 'backups/preview' || path === 'backups/restore') && method === 'POST') {
+        const incoming = upload()
+        const { Backup } = await import('./backup.ts')
+        const fsp = await import('node:fs/promises')
+        const folder = wb.root + '/backup-imports'
+        await fsp.mkdir(folder, { recursive: true })
+        const target = folder + '/import-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.zip'
+        await fsp.writeFile(target, incoming.data)
+        try {
+          if (path === 'backups/restore') wb.assertRestoreEpoch(epoch)
+          const backup = new Backup(wb)
+          return ok(path === 'backups/preview' ? backup.preview(target) : backup.restore(target))
+        } finally {
+          await fsp.unlink(target).catch(() => {})
+        }
+      }
+
+      if (path === 'shutdown' && method === 'POST') return ok({ ok: true, note: 'DSH 插件常驻运行，无需关停工作台' })
+      return json(res, 404, { error: '接口不存在' })
+    } catch (error) {
+      const name = (error as Error).name
+      if (error instanceof HttpStatus) return json(res, error.status, { error: error.message })
+      if (name === 'FolderOpenError') return json(res, 503, { error: (error as Error).message, code: 'FOLDER_OPEN_FAILED' })
+      if (name === 'ConflictError' || /已被更新|已被修改|冲突|已停止/.test((error as Error).message)) return json(res, 409, { error: (error as Error).message })
+      if (name === 'KeyError' || /不存在/.test((error as Error).message)) return json(res, 404, { error: (error as Error).message })
+      if (name === 'NovelAIError') return json(res, 400, { error: (error as Error).message })
+      if (name === 'TypeError' || name === 'ZodError') return json(res, 400, { error: '参数校验失败', details: (error as Error).message })
+      if (name === 'HTTPError' || name === 'FetchError') return json(res, 503, { error: '网络连接失败，请检查服务地址和代理' })
+      return json(res, 400, { error: `本地操作未完成，请检查配置、文件或凭据（${name}）`, detail: (error as Error).message?.slice(0, 300) })
+    }
+  }
+}
+
+const SHARE_PRIVATE_KEYS = new Set([
+  'context', 'snapshot', 'secret', 'secrets', 'nai_secret', 'token', 'nai_token', 'api_key',
+  'authorization', 'password', 'credential', 'credentials', 'base_url', 'nai_base_url',
+  'proxy_url', 'output_directory', 'output_dir', 'server_message_untrusted',
+])
+
+/** Share records use archive-relative paths; source images remain byte-for-byte originals. */
+function artworkShareValue(value: unknown, imageMembers: Map<string, string>, key = ''): unknown {
+  const lowerKey = key.toLowerCase()
+  if (SHARE_PRIVATE_KEYS.has(lowerKey)) return undefined
+  if (Array.isArray(value)) return value.map((item) => artworkShareValue(item, imageMembers, key)).filter((item) => item !== undefined)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([field, item]) => [field, artworkShareValue(item, imageMembers, field)])
+      .filter(([, item]) => item !== undefined))
+  }
+  if (typeof value === 'string') {
+    if (lowerKey === 'path' || lowerKey.endsWith('_path') || lowerKey.endsWith('_paths')) return imageMembers.get(value)
+    if (isAbsolute(value) || /^~[\\/]/u.test(value)) return undefined
+    return value.replace(/pst-[A-Za-z0-9_-]+/gu, '[credential omitted]')
+      .replace(/(?<!\w)(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*/gu, '[local path omitted]')
+      .replace(/(?<![:\w/])\/(?:[^/\s]+\/)+[^\r\n]*/gu, '[local path omitted]')
+  }
+  return value
+}
+
+async function testConnection(wb: Workbench, body: Rec): Promise<Rec> {
+  const endpointId = typeof body['endpoint_id'] === 'string' && body['endpoint_id'].trim() ? body['endpoint_id'].trim() : undefined
+  return {
+    ok: true, credits: await wb.credits(endpointId), allowance: await wb.endpointAllowance(endpointId),
+    endpoint: endpointId ?? wb.settings.public()['nai_active_endpoint'],
+  }
+}

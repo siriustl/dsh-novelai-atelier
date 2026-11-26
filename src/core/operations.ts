@@ -1,0 +1,851 @@
+/** Validated NovelAI image operations, independent of transport and harness. Ported from operations.py. */
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { z } from 'zod'
+import { expandPath } from './imageInputs.ts'
+import { prepareMask, readImage, type ImageInput, type MaskSettings } from './imageInputs.ts'
+import { compileRequest, GenerationRequestSchema, MODEL_IDS, splitPromptText, validateRequest, isV5, isV5Medium, type GenerationRequest, type CharacterInput } from './models.ts'
+import { decodePng, encodePng } from './png.ts'
+import { Raster, imageBase64, sha256Hex } from './raster.ts'
+import { preparePreciseReferenceImage } from './referenceImage.ts'
+
+export const OPERATION_ENDPOINTS = ['/ai/generate-image', '/ai/upscale', '/ai/augment-image', '/ai/encode-vibe'] as const
+
+export interface PreparedOperation {
+  operation: string
+  endpoint: string
+  payload: Record<string, unknown>
+  expected_outputs: number
+  expected_dimensions: Array<{ width: number; height: number }> | null
+  summary: Record<string, unknown>
+  warnings: string[]
+  generation_request: GenerationRequest | null
+  output_kind: string
+  max_anlas: number
+  output_subdir?: string | null
+  inpaint_context: {
+    source: Raster
+    mask: Raster
+    focus_box?: [number, number, number, number]
+  } | null
+}
+
+function prepared(partial: Partial<PreparedOperation> & Pick<PreparedOperation, 'operation' | 'endpoint' | 'payload'>): PreparedOperation {
+  return {
+    expected_outputs: 1, expected_dimensions: null, summary: {}, warnings: [],
+    generation_request: null, output_kind: 'image', max_anlas: 0, inpaint_context: null,
+    output_subdir: partial.output_subdir ?? partial.generation_request?.output_subdir ?? (partial.summary?.['request'] as { output_subdir?: string | null } | undefined)?.output_subdir ?? null,
+    ...partial,
+  }
+}
+
+// ---------- request schemas ----------
+
+const Base = GenerationRequestSchema.partial({ width: true, height: true }).extend({
+  max_anlas: z.number().int().min(0).default(0),
+})
+
+export const PRECISE_REFERENCE_TYPES = [
+  'character', 'style', 'character&style', 'outfit',
+  'costume', 'character_mainoutfit', 'character&style_anyoutfit',
+] as const
+
+export const PreciseReferenceSchema = z.object({
+  image_path: z.string().min(1),
+  type: z.enum(PRECISE_REFERENCE_TYPES).default('character'),
+  prefer_same_outfit: z.boolean().optional(),
+  strength: z.number().min(-5).max(5).default(1),
+  fidelity: z.number().min(-1).max(1).optional(),
+})
+export type PreciseReference = z.infer<typeof PreciseReferenceSchema>
+
+export const Img2ImgRequestSchema = Base.extend({
+  image_path: z.string().min(1).describe('Local PNG/JPEG/WebP source; never modified'),
+  strength: z.number().min(0.01).max(0.99).default(0.7),
+  noise: z.number().min(0).max(0.99).default(0),
+  extra_noise_seed: z.number().int().min(0).max(4294967295).nullable().optional(),
+  color_correct: z.boolean().default(false),
+  precise_references: z.array(PreciseReferenceSchema).max(16).default([]),
+})
+export type Img2ImgRequest = z.infer<typeof Img2ImgRequestSchema>
+
+export const EnhanceRequestSchema = Img2ImgRequestSchema.extend({
+  strength: z.number().min(0.01).max(0.99).default(0.2),
+  mode: z.enum(['regular', 'max']).default('regular'),
+  append_enhance_tags: z.boolean().default(true),
+})
+export type EnhanceRequest = z.infer<typeof EnhanceRequestSchema>
+
+export const InpaintRequestSchema = Base.omit({ model: true }).extend({
+  model: z.enum(['nai-diffusion-5-full', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']).default('nai-diffusion-5-full'),
+  image_path: z.string().min(1),
+  mask_path: z.string().min(1).describe('Same-size mask: white repaints and black preserves'),
+  mask_mode: z.enum(['luminance', 'alpha']).default('luminance'),
+  strength: z.number().min(0).max(1).default(1),
+  extra_noise_seed: z.number().int().min(0).max(4294967295).nullable().optional(),
+  color_correct: z.boolean().default(true),
+  focus_box: z.tuple([z.number().int().min(0), z.number().int().min(0), z.number().int().min(0), z.number().int().min(0)]).nullable().optional(),
+  focus_size: z.tuple([z.number().int().min(64).max(4096).multipleOf(64), z.number().int().min(64).max(4096).multipleOf(64)]).nullable().optional(),
+})
+export type InpaintRequest = z.infer<typeof InpaintRequestSchema>
+
+export const OutpaintRequestSchema = Base.omit({ model: true }).extend({
+  model: z.enum(['nai-diffusion-5-full', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']).default('nai-diffusion-5-full'),
+  image_path: z.string().min(1),
+  left: z.number().int().min(0).default(0),
+  right: z.number().int().min(0).default(0),
+  top: z.number().int().min(0).default(0),
+  bottom: z.number().int().min(0).default(0),
+  seam_overlap: z.number().int().min(0).max(128).default(32),
+  strength: z.number().min(0).max(1).default(1),
+  extra_noise_seed: z.number().int().min(0).max(4294967295).nullable().optional(),
+  color_correct: z.boolean().default(true),
+})
+export type OutpaintRequest = z.infer<typeof OutpaintRequestSchema>
+
+export const UpscaleRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
+  image_path: z.string().min(1),
+  model: z.literal('nai-diffusion-5-curated').default('nai-diffusion-5-curated'),
+  max_anlas: z.number().int().min(0).default(0),
+})
+export type UpscaleRequest = z.infer<typeof UpscaleRequestSchema>
+
+export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'scared', 'surprised', 'tired', 'excited',
+  'nervous', 'thinking', 'confused', 'shy', 'disgusted', 'smug', 'bored', 'laughing',
+  'irritated', 'aroused', 'embarrassed', 'worried', 'love', 'determined', 'hurt', 'playful'] as const
+
+export const AugmentRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
+  image_path: z.string().min(1),
+  tool: z.enum(['bg-removal', 'lineart', 'sketch', 'colorize', 'emotion', 'declutter', 'declutter-keep-bubbles']),
+  prompt: z.string().max(10000).default(''),
+  defry: z.number().int().min(0).max(5).default(0),
+  emotion: z.enum(EMOTIONS).nullable().optional(),
+  max_anlas: z.number().int().min(0).default(0),
+})
+export type AugmentRequest = z.infer<typeof AugmentRequestSchema>
+
+export const V45_MODELS = ['nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated'] as const
+
+export const EncodeVibeRequestSchema = z.object({
+  output_subdir: GenerationRequestSchema.shape.output_subdir,
+  image_path: z.string().min(1),
+  model: z.enum(V45_MODELS).default('nai-diffusion-4-5-full'),
+  information_extracted: z.number().min(0.01).max(1).default(0.7),
+  max_anlas: z.number().int().min(0).default(0),
+})
+export type EncodeVibeRequest = z.infer<typeof EncodeVibeRequestSchema>
+
+export const VibeReferenceSchema = z.object({
+  encoding_path: z.string().min(1).describe('Raw .vibe file saved by encode_vibe, or a .naiv4vibe JSON export'),
+  strength: z.number().min(0).max(1).default(0.6),
+  information_extracted: z.number().min(0.01).max(1).nullable().optional()
+    .describe('Select an already-encoded variant from a .naiv4vibe file; never re-encodes or changes a raw vibe'),
+})
+export type VibeReference = z.infer<typeof VibeReferenceSchema>
+
+export const ReferenceGenerationRequestSchema = Base.omit({ model: true }).extend({
+  model: z.enum(MODEL_IDS).default('nai-diffusion-5-full'),
+  vibes: z.array(VibeReferenceSchema).max(16).default([]),
+  precise_references: z.array(PreciseReferenceSchema).max(16).default([]),
+  normalize_vibe_strengths: z.boolean().default(true),
+})
+export type ReferenceGenerationRequest = z.infer<typeof ReferenceGenerationRequestSchema>
+
+/** Format a zod error into a single readable message. */
+export function zodMessage(error: z.ZodError): string {
+  return error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ')
+}
+
+// ---------- vibe reading ----------
+
+function readVibe(reference: VibeReference, model: string): { encoded: string; summary: Record<string, unknown> } {
+  const path = expandPath(reference.encoding_path)
+  if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`Vibe encoding file does not exist: ${path}`)
+  const data = readFileSync(path)
+  if (!data.length || data.length > 8 * 1024 * 1024) throw new Error('Vibe encoding must be nonempty and no larger than 8 MiB')
+  const summary: Record<string, unknown> = { path, sha256: sha256Hex(data), bytes: data.length }
+  const suffix = path.toLowerCase().endsWith('.naiv4vibe') ? '.naiv4vibe' : path.toLowerCase().endsWith('.vibe') ? '.vibe' : path.slice(path.lastIndexOf('.'))
+  if (suffix === '.naiv4vibe') {
+    let document: Record<string, unknown>
+    try { document = JSON.parse(data.toString('utf8')) } catch { throw new Error('Invalid .naiv4vibe export') }
+    if (!document || typeof document !== 'object') throw new Error('Invalid .naiv4vibe export')
+    const importInfo = document['importInfo'] as Record<string, unknown> | undefined
+    const metadataModel = importInfo && typeof importInfo === 'object' ? importInfo['model'] : undefined
+    if (metadataModel && metadataModel !== model) throw new Error('Vibe model differs from the selected generation model')
+    const candidates: Array<[string, unknown]> = []
+    const encodings = document['encodings'] as Record<string, Record<string, Record<string, unknown>>>
+    try {
+      for (const group of Object.values(encodings ?? {})) {
+        for (const slot of Object.values(group ?? {})) {
+          const information = (slot['params'] as Record<string, unknown> | undefined)?.['information_extracted']
+          if (reference.information_extracted == null || (typeof information === 'number' && Math.abs(information - reference.information_extracted) < 0.000001)) {
+            if (slot['encoding']) candidates.push([slot['encoding'] as string, information])
+          }
+        }
+      }
+    } catch {
+      throw new Error('Invalid .naiv4vibe export')
+    }
+    if (candidates.length !== 1) throw new Error('Select one information_extracted value present in the .naiv4vibe export')
+    const [encoded, information] = candidates[0]!
+    const raw = Buffer.from(encoded, 'base64')
+    if (!raw.length) throw new Error('The selected vibe encoding is empty')
+    summary['information_extracted'] = information
+    return { encoded, summary }
+  }
+  if (suffix !== '.vibe') throw new Error('Use an encoded .vibe or .naiv4vibe file, not an ordinary image; first call encode_vibe')
+  // A raw encoding may have the JSON receipt written by our service next to it.
+  const receiptPath = path.slice(0, -'.vibe'.length) + '.json'
+  let recordedInformation: unknown = undefined
+  if (existsSync(receiptPath)) {
+    if (statSync(receiptPath).size > 1024 * 1024) throw new Error('Vibe receipt exceeds the size limit')
+    let receipt: Record<string, unknown>
+    try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) } catch { throw new Error('Invalid vibe JSON receipt') }
+    const stored = (receipt['request'] ?? ((receipt['summary'] as Record<string, unknown> | undefined)?.['request'] as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>
+    if (stored['model'] && stored['model'] !== model) throw new Error('Vibe model differs from the selected generation model')
+    recordedInformation = stored['information_extracted']
+  }
+  if (reference.information_extracted != null && recordedInformation !== reference.information_extracted)
+    throw new Error("A raw vibe's information_extracted cannot be changed; select its recorded value or encode again")
+  summary['information_extracted'] = recordedInformation
+  return { encoded: data.toString('base64'), summary }
+}
+
+// ---------- inpaint postprocessing ----------
+
+export interface InpaintPostContext {
+  sourcePng: Uint8Array
+  maskPng: Uint8Array
+  generated: Uint8Array
+  prepared: PreparedOperation
+}
+
+/** Composite API pixels only inside the prepared mask, without touching files.
+ * The raw API result should also be retained by the caller: compositing changes
+ * the alpha-channel bits that may carry NovelAI's hidden metadata. */
+export function postprocessInpaint(sourcePng: Uint8Array, maskPng: Uint8Array, generatedPng: Uint8Array, prepared: PreparedOperation): Buffer {
+  if (prepared.operation !== 'inpaint' && prepared.operation !== 'outpaint') throw new Error('Inpaint postprocessing requires a prepared inpaint or outpaint operation')
+  const source = Raster.fromDecoded(decodePng(sourcePng))
+  const mask = Raster.fromDecoded(decodePng(maskPng))
+  const generatedRaw = decodePng(generatedPng)
+  const generated = Raster.fromDecoded(generatedRaw)
+  if (mask.width !== source.width || mask.height !== source.height)
+    throw new Error('Inpaint source and mask dimensions must match before compositing')
+  const parameters = prepared.payload['parameters'] as Record<string, unknown>
+  if (generated.width !== parameters['width'] || generated.height !== parameters['height'])
+    throw new Error('Inpaint response dimensions must match the prepared API tile')
+  let result: Raster
+  const context = prepared.inpaint_context
+  if (context?.focus_box) {
+    const [left, top, right, bottom] = context.focus_box
+    const patch = generated.resize(right - left, bottom - top)
+    const canvas = context.source.clone()
+    compositeAt(canvas, patch, left, top)
+    result = compositeByMask(canvas, context.source, context.mask)
+  } else {
+    if (generated.width !== source.width || generated.height !== source.height)
+      throw new Error('Unfocused inpaint response dimensions must match the source canvas')
+    const finalMask = context ? context.mask : mask
+    result = compositeByMask(generated, source, finalMask)
+  }
+  // Preserve generated text chunks; annotate the composite.
+  const text: Array<{ keyword: string; text: string; latin?: boolean }> = generatedRaw.text.map((t) => ({ keyword: t.keyword, text: t.text }))
+  text.push({ keyword: 'NovelAI-MCP-Inpaint', text: 'Generated pixels composited inside the binary mask; unmasked pixels preserved', latin: true })
+  const actual: Record<string, unknown> = Object.fromEntries(Object.entries(parameters).filter(([k]) => k !== 'image' && k !== 'mask'))
+  actual['prompt'] = prepared.payload['input']
+  actual['model'] = prepared.payload['model']
+  actual['action'] = 'infill'
+  if (!generatedRaw.text.some((t) => t.keyword === 'Comment')) {
+    text.push({ keyword: 'Comment', text: JSON.stringify(actual) })
+    text.push({ keyword: 'NovelAI-MCP-Metadata-Source', text: 'Compiled request; original API output retained separately', latin: true })
+  }
+  return encodePng(result.width, result.height, result.data, { text, iccProfile: generatedRaw.iccProfile, phys: generatedRaw.phys })
+}
+
+function compositeAt(canvas: Raster, patch: Raster, left: number, top: number): void {
+  for (let y = 0; y < patch.height; y++) {
+    for (let x = 0; x < patch.width; x++) {
+      const s = (y * patch.width + x) * 4
+      const d = ((y + top) * canvas.width + (x + left)) * 4
+      canvas.data[d] = patch.data[s]!
+      canvas.data[d + 1] = patch.data[s + 1]!
+      canvas.data[d + 2] = patch.data[s + 2]!
+      canvas.data[d + 3] = patch.data[s + 3]!
+    }
+  }
+}
+
+/** result = a where mask>127 else b (Pillow Image.composite semantics on mask L). */
+function compositeByMask(a: Raster, b: Raster, mask: Raster): Raster {
+  const out = new Uint8Array(a.width * a.height * 4)
+  const lum = mask.luminance()
+  for (let i = 0; i < a.width * a.height; i++) {
+    const useA = lum[i]! > 127
+    const s = useA ? a.data : b.data
+    out[i * 4] = s[i * 4]!
+    out[i * 4 + 1] = s[i * 4 + 1]!
+    out[i * 4 + 2] = s[i * 4 + 2]!
+    out[i * 4 + 3] = s[i * 4 + 3]!
+  }
+  return new Raster(a.width, a.height, out)
+}
+
+// ---------- preparation ----------
+
+function fullRequest(r: Omit<GenerationRequest, 'width' | 'height'> & { width: number; height: number }): GenerationRequest {
+  const request = GenerationRequestSchema.parse(r)
+  validateRequest(request)
+  return request
+}
+
+export function prepareGeneration(request: GenerationRequest): PreparedOperation {
+  const { payload, warnings } = compileRequest(request)
+  // Medium rewrites several fields before submission; the preview must not show the unused ones.
+  const effective = isV5Medium(request)
+    ? { ...request, steps: 14, sampler: 'k_euler_ancestral', cfg_rescale: 0, negative_preset: 'heavy', negative_prompt: '' }
+    : request
+  return prepared({
+    operation: 'generate', endpoint: '/ai/generate-image', payload,
+    expected_dimensions: [{ width: request.width, height: request.height }],
+    summary: { request: effective }, warnings, generation_request: request, max_anlas: request.max_anlas,
+  })
+}
+
+function dims(raw: Record<string, unknown>): { explicit: boolean; width?: number; height?: number } {
+  const hasW = 'width' in raw, hasH = 'height' in raw
+  if (hasW !== hasH) throw new Error('Set both width and height, or omit both to use the source size')
+  return { explicit: hasW, width: raw['width'] as number | undefined, height: raw['height'] as number | undefined }
+}
+
+/** Prepare a request locally; performs no network calls and writes nothing. */
+/** Kinds whose arguments come straight from the model; used to flag silently dropped keys. */
+const KIND_SCHEMAS: Record<string, { shape: Record<string, unknown> }> = {
+  generate: GenerationRequestSchema,
+  img2img: Img2ImgRequestSchema,
+  enhance: EnhanceRequestSchema,
+  inpaint: InpaintRequestSchema,
+  outpaint: OutpaintRequestSchema,
+  upscale: UpscaleRequestSchema,
+  augment: AugmentRequestSchema,
+  encode_vibe: EncodeVibeRequestSchema,
+  reference_generate: ReferenceGenerationRequestSchema,
+}
+
+export async function prepareOperation(rawRequest: unknown, kind: string): Promise<PreparedOperation> {
+  const preparedOp = await prepareOperationInner(rawRequest, kind)
+  const schema = KIND_SCHEMAS[kind]
+  if (schema && rawRequest instanceof Object && !Array.isArray(rawRequest)) {
+    const ignored = Object.keys(rawRequest as Record<string, unknown>).filter((key) => key !== 'request' && !(key in schema.shape))
+    if (ignored.length) preparedOp.warnings.push(`忽略未知参数：${ignored.join('、')}`)
+  }
+  return preparedOp
+}
+
+async function prepareOperationInner(rawRequest: unknown, kind: string): Promise<PreparedOperation> {
+  if (kind === 'upscale') {
+    const request = UpscaleRequestSchema.parse(rawRequest)
+    const source = await readImage(request.image_path)
+    if (source.image.width * source.image.height > 3145728) throw new Error('Dedicated upscaling accepts source images up to 3,145,728 pixels')
+    const payload = { image: imageBase64(source.image), model: request.model, declared_blur_sigma: 0 }
+    return prepared({
+      operation: 'upscale', endpoint: '/ai/upscale', payload,
+      expected_dimensions: [{ width: source.image.width * 2, height: source.image.height * 2 }],
+      summary: { request, source: source.summary, scale_per_axis: 2 }, max_anlas: request.max_anlas,
+    })
+  }
+  if (kind === 'augment') {
+    const request = AugmentRequestSchema.parse(rawRequest)
+    if (request.tool === 'emotion' && !request.emotion) throw new Error('The emotion tool requires an emotion')
+    if (request.tool !== 'emotion' && request.emotion) throw new Error('emotion is only valid for the emotion tool')
+    if (!['emotion', 'colorize'].includes(request.tool) && (request.prompt || request.defry))
+      throw new Error('prompt and defry apply only to colorize and emotion')
+    if (request.prompt.includes(';;') && request.tool === 'emotion') throw new Error("Provide the emotion separately; the prompt must not contain ';;'")
+    const source = await readImage(request.image_path)
+    if (source.image.width * source.image.height > 3145728) throw new Error('Director Tools accept images up to 3,145,728 pixels')
+    const payload: Record<string, unknown> = {
+      req_type: request.tool, image: imageBase64(source.image),
+      width: source.image.width, height: source.image.height, use_new_shared_trial: true,
+    }
+    if (request.tool === 'emotion' || request.tool === 'colorize') {
+      payload['prompt'] = request.tool === 'emotion' ? `${request.emotion};;${request.prompt}` : request.prompt
+      payload['defry'] = request.defry
+    }
+    const count = request.tool === 'bg-removal' ? 3 : 1
+    return prepared({
+      operation: 'augment', endpoint: '/ai/augment-image', payload, expected_outputs: count,
+      expected_dimensions: Array.from({ length: count }, () => ({ width: source.image.width, height: source.image.height })),
+      summary: { request, source: source.summary }, max_anlas: request.max_anlas,
+    })
+  }
+  if (kind === 'encode_vibe') {
+    const request = EncodeVibeRequestSchema.parse(rawRequest)
+    const informationExtracted = 'information_extracted' in (rawRequest as object) ? request.information_extracted : (request.model.endsWith('curated') ? 1 : request.information_extracted)
+    const source = await readImage(request.image_path)
+    return prepared({
+      operation: 'encode_vibe', endpoint: '/ai/encode-vibe',
+      payload: { image: imageBase64(source.image), model: request.model, information_extracted: informationExtracted },
+      summary: { request: { ...request, information_extracted: informationExtracted }, source: source.summary },
+      output_kind: 'vibe', max_anlas: request.max_anlas,
+    })
+  }
+  if (kind === 'reference_generate') {
+    const request = ReferenceGenerationRequestSchema.parse(rawRequest)
+    if (request.precise_references.length) return prepareReferencesAsync(request)
+    return prepareReferences(request)
+  }
+  if (kind === 'generate') {
+    const request = GenerationRequestSchema.parse(rawRequest)
+    validateRequest(request)
+    return prepareGeneration(request)
+  }
+  if (kind === 'img2img' || kind === 'enhance') {
+    const request: EnhanceRequest = kind === 'img2img'
+      ? { ...Img2ImgRequestSchema.parse(rawRequest), mode: 'regular', append_enhance_tags: false }
+      : EnhanceRequestSchema.parse(rawRequest)
+    if (request.mode === 'max' && !isV5(request.model)) throw new Error('Max Enhance is only supported on V5')
+    return prepareImageToImage(request, kind === 'img2img' ? 'img2img' : 'enhance', rawRequest as Record<string, unknown>)
+  }
+  if (kind === 'inpaint') {
+    const raw = rawRequest as Record<string, unknown>
+    if (raw['model'] === 'nai-diffusion-5-curated')
+      throw new Error('V5 Curated inpainting is not deployed: the live API reports that its model does not exist. Choose nai-diffusion-5-full or nai-diffusion-4-5-curated explicitly; no model is silently substituted.')
+    const request = InpaintRequestSchema.parse(raw)
+    if (request.focus_size && !request.focus_box) throw new Error('focus_size requires focus_box')
+    if (request.focus_box && (request.focus_box[2] <= request.focus_box[0] || request.focus_box[3] <= request.focus_box[1]))
+      throw new Error('focus_box needs right > left and bottom > top')
+    return prepareInpaint(request, raw)
+  }
+  if (kind === 'outpaint') {
+    const raw = rawRequest as Record<string, unknown>
+    const request = OutpaintRequestSchema.parse(raw)
+    return prepareOutpaint(request, raw)
+  }
+  throw new Error(`Unsupported operation kind: ${kind}`)
+}
+
+interface ResolvedPreciseReference {
+  baseCaption: string
+  strength: number
+  secondaryStrength: number
+  isCharacterLike: boolean
+}
+
+function resolvePreciseReference(ref: PreciseReference, v5: boolean, warnings: string[]): ResolvedPreciseReference {
+  if (!v5 && (ref.strength < -1 || ref.strength > 1)) {
+    throw new Error('V4.5 Precise Reference strength must be between -1 and 1')
+  }
+  let baseCaption: string
+  let isCharacterLike = false
+  if (ref.type === 'outfit' || ref.type === 'costume') {
+    if (!v5) throw new Error('Outfit Reference (outfit/costume) is only supported on V5 models')
+    if (ref.prefer_same_outfit !== undefined) throw new Error('prefer_same_outfit only applies to character or character&style references')
+    baseCaption = 'costume'
+  } else if (ref.type === 'character_mainoutfit') {
+    if (!v5) throw new Error('character_mainoutfit is only supported on V5 models')
+    if (ref.prefer_same_outfit === false) throw new Error('character_mainoutfit conflicts with prefer_same_outfit=false; use type="character" instead')
+    baseCaption = 'character_mainoutfit'
+    isCharacterLike = true
+  } else if (ref.type === 'character&style_anyoutfit') {
+    if (!v5) throw new Error('character&style_anyoutfit is only supported on V5 models')
+    if (ref.prefer_same_outfit === true) throw new Error('character&style_anyoutfit conflicts with prefer_same_outfit=true; use type="character&style" instead')
+    baseCaption = 'character&style_anyoutfit'
+    isCharacterLike = true
+  } else if (ref.type === 'character') {
+    if (!v5 && ref.prefer_same_outfit !== undefined) throw new Error('prefer_same_outfit is only supported on V5 models')
+    baseCaption = v5 && ref.prefer_same_outfit === true ? 'character_mainoutfit' : 'character'
+    isCharacterLike = true
+  } else if (ref.type === 'character&style') {
+    if (!v5 && ref.prefer_same_outfit !== undefined) throw new Error('prefer_same_outfit is only supported on V5 models')
+    baseCaption = v5 && ref.prefer_same_outfit === false ? 'character&style_anyoutfit' : 'character&style'
+    isCharacterLike = true
+  } else {
+    if (ref.prefer_same_outfit !== undefined) throw new Error('prefer_same_outfit only applies to character or character&style references')
+    baseCaption = 'style'
+  }
+  let secondaryStrength: number
+  if (v5) {
+    if (ref.fidelity !== undefined && ref.fidelity !== 1) {
+      warnings.push('V5 Precise Reference removed the Fidelity slider; fidelity is fixed at 1 (secondary_strength=0) on V5')
+    }
+    secondaryStrength = 0
+  } else {
+    const fidelity = ref.fidelity ?? 1
+    secondaryStrength = Math.max(0, Math.min(1, 1 - fidelity))
+  }
+  return { baseCaption, strength: ref.strength, secondaryStrength, isCharacterLike }
+}
+
+async function attachPreciseReferences(preparedOp: PreparedOperation, references: PreciseReference[], model: string): Promise<void> {
+  if (!references.length) return
+  const v5 = isV5(model)
+  const resolved = references.map((ref) => resolvePreciseReference(ref, v5, preparedOp.warnings))
+  if (resolved.filter((r) => r.isCharacterLike).length > 1) {
+    preparedOp.warnings.push('Multiple character references blend identities; they are not assigned to separate character prompts')
+  }
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  const images: string[] = []
+  const summaries: Record<string, unknown>[] = []
+  for (let i = 0; i < references.length; i++) {
+    const ref = references[i]!
+    const item = resolved[i]!
+    const source = await readImage(ref.image_path)
+    const preparedImg = await preparePreciseReferenceImage(source, v5)
+    images.push(preparedImg.base64)
+    summaries.push({
+      ...source.summary,
+      prepared_width: preparedImg.prepared_width,
+      prepared_height: preparedImg.prepared_height,
+      preprocessing: preparedImg.preprocessing,
+      wire_caption: item.baseCaption,
+    })
+  }
+  params['director_reference_images'] = images
+  params['director_reference_descriptions'] = resolved.map((r) => ({ caption: { base_caption: r.baseCaption, char_captions: [] }, legacy_uc: false }))
+  params['director_reference_strength_values'] = resolved.map((r) => r.strength)
+  params['director_reference_secondary_strength_values'] = resolved.map((r) => r.secondaryStrength)
+  params['director_reference_information_extracted'] = resolved.map(() => 1)
+  preparedOp.summary['precise_reference_paths'] = references.map((r) => r.image_path)
+  preparedOp.summary['references'] = summaries
+}
+
+function prepareReferences(request: ReferenceGenerationRequest): PreparedOperation {
+  if (!request.vibes.length && !request.precise_references.length) throw new Error('Provide at least one vibe or precise reference')
+  if (request.vibes.length && request.precise_references.length) throw new Error('Vibe Transfer and Precise Reference cannot be combined')
+  if (request.vibes.length && isV5(request.model)) throw new Error('Vibe Transfer is only supported on V4.5 models')
+  const base = fullRequest({ ...request, width: request.width ?? 832, height: request.height ?? 1216 })
+  const preparedOp = prepareGeneration(base)
+  // summary.request 必须携带引用字段：quote/validate 用 resolved_request 复检（Python 版经 pydantic 继承天然保留）。
+  preparedOp.summary['request'] = {
+    ...(preparedOp.summary['request'] as Record<string, unknown>),
+    vibes: request.vibes, precise_references: request.precise_references,
+    normalize_vibe_strengths: request.normalize_vibe_strengths,
+  }
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  const summaries: Record<string, unknown>[] = []
+  if (request.vibes.length) {
+    const encodings = request.vibes.map((r) => readVibe(r, request.model))
+    let strengths = request.vibes.map((r) => r.strength)
+    const total = strengths.reduce((a, b) => a + b, 0)
+    if (request.normalize_vibe_strengths && total > 1) strengths = strengths.map((s) => s / total)
+    params['reference_image_multiple'] = encodings.map((e) => e.encoded)
+    params['reference_strength_multiple'] = strengths
+    params['controlnet_strength'] = 1
+    params['normalize_reference_strength_multiple'] = request.normalize_vibe_strengths
+    encodings.forEach((e, i) => summaries.push({ ...e.summary, effective_strength: strengths[i] }))
+  } else {
+    preparedOp.summary['precise_reference_paths'] = request.precise_references.map((r) => r.image_path)
+  }
+  preparedOp.operation = 'reference_generate'
+  preparedOp.summary['references'] = summaries
+  return preparedOp
+}
+
+export async function prepareReferencesAsync(request: ReferenceGenerationRequest): Promise<PreparedOperation> {
+  const preparedOp = prepareReferences(request)
+  if (request.precise_references.length) {
+    await attachPreciseReferences(preparedOp, request.precise_references, request.model)
+  }
+  return preparedOp
+}
+
+async function prepareImageToImage(request: EnhanceRequest, operation: 'img2img' | 'enhance', raw: Record<string, unknown>): Promise<PreparedOperation> {
+  if (operation === 'enhance' && request.precise_references.length > 0) {
+    throw new Error('Precise Reference is supported on generate and img2img, not enhance')
+  }
+  const source = await readImage(request.image_path)
+  const { explicit, width, height } = dims(raw)
+  let resolvedW: number, resolvedH: number
+  if (explicit) {
+    resolvedW = width!; resolvedH = height!
+  } else {
+    resolvedW = source.image.width; resolvedH = source.image.height
+  }
+  let resolved = fullRequest({ ...request, width: resolvedW, height: resolvedH })
+  if (request.mode === 'max' && (resolved.width !== source.image.width || resolved.height !== source.image.height))
+    throw new Error('Max Enhance chooses its own output size; omit width and height or use the source dimensions')
+  if (operation === 'enhance' && request.mode === 'regular' && request.append_enhance_tags && !resolved.prompt.includes('upscaled, blurry')) {
+    const [prompt, text] = splitPromptText(resolved.prompt)
+    let p = prompt.replace(/[ ,\n]+$/u, '') + ', -2::upscaled, blurry::'
+    if (text !== null) p += '\nText: ' + text
+    resolved = { ...resolved, prompt: p }
+    validateRequest(resolved)
+  }
+  const preparedOp = prepareGeneration(resolved)
+  const effectiveRequest: Record<string, unknown> = { ...request, width: resolved.width, height: resolved.height }
+  if (operation === 'img2img') {
+    delete effectiveRequest['mode']
+    delete effectiveRequest['append_enhance_tags']
+    if (!request.precise_references.length) delete effectiveRequest['precise_references']
+  } else {
+    delete effectiveRequest['precise_references']
+  }
+  const seed = (preparedOp.payload['parameters'] as Record<string, unknown>)['seed']
+  effectiveRequest['seed'] = seed
+  preparedOp.summary = {
+    request: effectiveRequest, user_request: stripDefaults(raw), source: source.summary,
+    resolved_width: resolved.width, resolved_height: resolved.height,
+  }
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  params['extra_noise_seed'] = request.extra_noise_seed ?? (Number(seed) - 1 + 4294967296) % 4294967296
+  params['add_original_image'] = false
+  const outputSize = { width: resolved.width, height: resolved.height }
+  let image = source.image
+  if (image.width !== outputSize.width || image.height !== outputSize.height) {
+    image = image.resize(outputSize.width, outputSize.height)
+    preparedOp.warnings.push('Source pixels are resized in memory to the requested output dimensions; the source file is unchanged')
+  }
+  preparedOp.payload['action'] = 'img2img'
+  params['image'] = imageBase64(image)
+  params['strength'] = request.strength
+  params['noise'] = request.noise
+  params['color_correct'] = request.color_correct
+  preparedOp.operation = operation
+  if (operation === 'img2img' && request.precise_references.length > 0) {
+    await attachPreciseReferences(preparedOp, request.precise_references, resolved.model)
+  }
+  if (operation === 'enhance' && request.mode === 'max') {
+    params['upscaled_enhance'] = true
+    const w16 = Math.floor(image.width / 16) * 32, h16 = Math.floor(image.height / 16) * 32
+    const factor = Math.min(1, Math.sqrt(3145728 / (w16 * h16)))
+    let size: [number, number] = [Math.floor((w16 * factor) / 32 + 0.5) * 32, Math.floor((h16 * factor) / 32 + 0.5) * 32]
+    if (size[0] * size[1] > 3145728) size = [Math.floor((w16 * factor) / 32) * 32, Math.floor((h16 * factor) / 32) * 32]
+    preparedOp.summary['output_dimensions_estimate'] = size
+    preparedOp.expected_dimensions = null
+    preparedOp.warnings.push('Max Enhance selects the final output dimensions server-side, up to approximately 3 megapixels')
+  }
+  return preparedOp
+}
+
+async function prepareInpaint(request: InpaintRequest, raw: Record<string, unknown>): Promise<PreparedOperation> {
+  const source = await readImage(request.image_path)
+  const isFocused = request.focus_box != null
+  const { explicit } = dims(raw)
+  let resolved: GenerationRequest
+  let workingSize: [number, number] = [source.image.width, source.image.height]
+  if (isFocused) {
+    if (explicit && (raw['width'] !== source.image.width || raw['height'] !== source.image.height))
+      throw new Error('Focused inpainting preserves the source canvas; omit width/height, or set both to its exact size')
+    const [left, top, right, bottom] = request.focus_box!
+    if (right > source.image.width || bottom > source.image.height) throw new Error('focus_box exceeds the source dimensions')
+    workingSize = request.focus_size ?? [Math.max(64, Math.ceil((right - left) / 64) * 64), Math.max(64, Math.ceil((bottom - top) / 64) * 64)]
+    resolved = fullRequest({ ...request, width: workingSize[0], height: workingSize[1] })
+  } else {
+    const { width, height } = dims(raw)
+    if (explicit) {
+      if (width !== source.image.width || height !== source.image.height)
+        throw new Error('Inpainting output dimensions must match the source image; resize the image and mask together first')
+    }
+    resolved = fullRequest({ ...request, width: source.image.width, height: source.image.height })
+  }
+  const preparedOp = prepareGeneration(resolved)
+  const seed = (preparedOp.payload['parameters'] as Record<string, unknown>)['seed'] as number
+  const effectiveRequest: Record<string, unknown> = { ...request, seed }
+  if (isFocused) {
+    // width/height are canvas constraints, not the API tile dimensions.
+    delete effectiveRequest['width']; delete effectiveRequest['height']
+  }
+  preparedOp.summary = {
+    request: effectiveRequest, user_request: stripDefaults(raw), source: source.summary,
+    resolved_width: resolved.width, resolved_height: resolved.height,
+  }
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  params['extra_noise_seed'] = request.extra_noise_seed ?? (seed - 1 + 4294967296) % 4294967296
+  params['add_original_image'] = false
+
+  const maskSource = await readImage(request.mask_path)
+  if (maskSource.image.width !== source.image.width || maskSource.image.height !== source.image.height)
+    throw new Error('Mask dimensions must exactly match the source image')
+  if (request.mask_mode === 'alpha' && !maskSource.summary['has_alpha']) throw new Error('mask_mode=alpha requires a mask with an alpha channel')
+  const signal = request.mask_mode === 'alpha' ? maskSource.image.alphaChannel() : maskSource.image.luminance()
+  const originalMask = thresholdMask(source.image.width, source.image.height, signal)
+  if (!originalMask.maskBounds(originalMask.luminance())) throw new Error('Mask has no repaint region')
+
+  preparedOp.inpaint_context = { source: source.image, mask: originalMask }
+  let workingImage = source.image
+  let workingMask: Raster
+  let maskSettings: MaskSettings = { mode: request.mask_mode, white_means: 'repaint', grid: 1, repaint_pixels: -1, repaint_fraction: -1 }
+
+  if (request.focus_box) {
+    const [left, top, right, bottom] = request.focus_box
+    if (right > source.image.width || bottom > source.image.height) throw new Error('focus_box exceeds the source dimensions')
+    const bounds = originalMask.maskBounds(originalMask.luminance())
+    if (!bounds || bounds[0] < left || bounds[1] < top || bounds[2] > right || bounds[3] > bottom)
+      throw new Error('focus_box must contain every repaint pixel after mask alignment')
+    workingSize = request.focus_size ?? [Math.max(64, Math.ceil((right - left) / 64) * 64), Math.max(64, Math.ceil((bottom - top) / 64) * 64)]
+    const workingRequest = fullRequest({ ...resolved, width: workingSize[0], height: workingSize[1] })
+    const characters: CharacterInput[] = []
+    for (const character of workingRequest.characters) {
+      let c = { ...character }
+      if (c.x != null && c.y != null) {
+        const x = (c.x * source.image.width - left) / (right - left)
+        const y = (c.y * source.image.height - top) / (bottom - top)
+        if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1))
+          throw new Error('A character position falls outside focus_box; omit positions or adapt the character prompts for the focused region')
+        c = { ...c, x, y }
+      }
+      characters.push(c)
+    }
+    const focusedReq: GenerationRequest = { ...workingRequest, characters, seed }
+    const focused = prepareGeneration(focusedReq)
+    focused.summary = preparedOp.summary
+    const fparams = focused.payload['parameters'] as Record<string, unknown>
+    fparams['extra_noise_seed'] = params['extra_noise_seed']
+    fparams['add_original_image'] = false
+    focused.inpaint_context = { source: source.image, mask: originalMask, focus_box: [...request.focus_box] }
+    focused.summary['focus_box'] = request.focus_box
+    focused.summary['focus_size'] = workingSize
+    focused.summary['output_dimensions'] = [source.image.width, source.image.height]
+    workingImage = source.image.cropDestructive(left, top, right, bottom).resize(workingSize[0], workingSize[1])
+    const maskCrop = originalMask.cropDestructive(left, top, right, bottom).resize(workingSize[0], workingSize[1], 'nearest')
+    const aligned = prepareMask({ image: maskCrop, summary: { has_alpha: false } }, { width: workingSize[0], height: workingSize[1] }, 'luminance')
+    workingMask = aligned.mask
+    maskSettings = aligned.settings
+    preparedOp.summary['mask_settings'] = maskSettings
+    preparedOp.payload = focused.payload
+    preparedOp.operation = 'inpaint'
+    preparedOp.inpaint_context = focused.inpaint_context
+    preparedOp.summary = focused.summary
+    preparedOp.generation_request = focused.generation_request
+    preparedOp.max_anlas = focused.max_anlas
+    preparedOp.expected_dimensions = focused.expected_dimensions
+    preparedOp.warnings = focused.warnings
+    preparedOp.endpoint = focused.endpoint
+  } else {
+    const aligned = prepareMask(maskSource, { width: source.image.width, height: source.image.height }, request.mask_mode)
+    workingMask = aligned.mask
+    maskSettings = aligned.settings
+    preparedOp.summary['mask_settings'] = maskSettings
+  }
+  const finalParams = preparedOp.payload['parameters'] as Record<string, unknown>
+  preparedOp.payload['model'] = String(preparedOp.payload['model']) + '-inpainting'
+  preparedOp.payload['action'] = 'infill'
+  finalParams['image'] = imageBase64(workingImage)
+  finalParams['mask'] = imageBase64(workingMask)
+  finalParams['inpaintImg2ImgStrength'] = request.strength
+  if (request.strength < 1)
+    finalParams['img2img'] = { strength: request.strength, color_correct: request.color_correct }
+  preparedOp.summary['mask'] = maskSource.summary
+  preparedOp.operation = 'inpaint'
+  return preparedOp
+}
+
+async function prepareOutpaint(request: OutpaintRequest, raw: Record<string, unknown>): Promise<PreparedOperation> {
+  const source = await readImage(request.image_path)
+  if (raw['model'] === 'nai-diffusion-5-curated')
+    throw new Error('V5 Curated inpainting is not deployed: choose nai-diffusion-5-full or nai-diffusion-4-5-curated explicitly; no model is silently substituted.')
+
+  let left = request.left, right = request.right, top = request.top, bottom = request.bottom
+  if (left === 0 && right === 0 && top === 0 && bottom === 0)
+    throw new Error('At least one of left, right, top, bottom must be greater than 0 for outpainting')
+
+  const rawW = source.image.width + left + right
+  const targetW = Math.ceil(rawW / 64) * 64
+  const diffW = targetW - rawW
+  if (diffW > 0) {
+    if (right > 0) right += diffW
+    else left += diffW
+  }
+
+  const rawH = source.image.height + top + bottom
+  const targetH = Math.ceil(rawH / 64) * 64
+  const diffH = targetH - rawH
+  if (diffH > 0) {
+    if (bottom > 0) bottom += diffH
+    else top += diffH
+  }
+
+  const { explicit, width, height } = dims(raw)
+  if (explicit && (width !== targetW || height !== targetH))
+    throw new Error('Outpainting dimensions are derived from the source and expansion; omit width/height or provide the exact aligned target size')
+
+  if (targetW * targetH > 4194304) {
+    throw new Error(`Outpainted target canvas (${targetW}×${targetH}) exceeds the 4-megapixel limit`)
+  }
+
+  const workingImage = Raster.blank(targetW, targetH, [255, 255, 255, 255])
+  workingImage.blit(source.image, left, top)
+
+  const overlap = request.seam_overlap
+  const insetLeft = left > 0 ? Math.min(overlap, source.image.width) : 0
+  const insetRight = right > 0 ? Math.min(overlap, source.image.width - insetLeft) : 0
+  const insetTop = top > 0 ? Math.min(overlap, source.image.height) : 0
+  const insetBottom = bottom > 0 ? Math.min(overlap, source.image.height - insetTop) : 0
+
+  const presLeft = left + insetLeft
+  const presTop = top + insetTop
+  const presWidth = source.image.width - insetLeft - insetRight
+  const presHeight = source.image.height - insetTop - insetBottom
+
+  const originalMask = Raster.blank(targetW, targetH, [255, 255, 255, 255])
+  if (presWidth > 0 && presHeight > 0) {
+    originalMask.fillRect(presLeft, presTop, presWidth, presHeight, [0, 0, 0, 255])
+  }
+
+  const characters: CharacterInput[] = []
+  for (const c of request.characters) {
+    let charInput = { ...c }
+    if (charInput.x != null && charInput.y != null) {
+      const origPxX = charInput.x * source.image.width
+      const origPxY = charInput.y * source.image.height
+      const newX = Math.max(0, Math.min(1, (origPxX + left) / targetW))
+      const newY = Math.max(0, Math.min(1, (origPxY + top) / targetH))
+      charInput = { ...charInput, x: newX, y: newY }
+    }
+    characters.push(charInput)
+  }
+
+  const resolved = fullRequest({ ...request, width: targetW, height: targetH, characters })
+  const preparedOp = prepareGeneration(resolved)
+  const seed = (preparedOp.payload['parameters'] as Record<string, unknown>)['seed'] as number
+  const effectiveRequest: Record<string, unknown> = { ...request, seed, left, right, top, bottom }
+  delete effectiveRequest['width']
+  delete effectiveRequest['height']
+
+  preparedOp.summary = {
+    request: effectiveRequest, user_request: stripDefaults(raw), source: source.summary,
+    resolved_width: targetW, resolved_height: targetH,
+    outpaint: {
+      left, right, top, bottom, seam_overlap: overlap,
+      source_width: source.image.width, source_height: source.image.height,
+      target_width: targetW, target_height: targetH,
+    },
+  }
+
+  const aligned = prepareMask({ image: originalMask, summary: { has_alpha: false } }, { width: targetW, height: targetH }, 'luminance')
+  const workingMask = aligned.mask
+  preparedOp.summary['mask_settings'] = aligned.settings
+
+  const params = preparedOp.payload['parameters'] as Record<string, unknown>
+  params['extra_noise_seed'] = request.extra_noise_seed ?? (seed - 1 + 4294967296) % 4294967296
+  params['add_original_image'] = false
+  preparedOp.payload['model'] = String(preparedOp.payload['model']) + '-inpainting'
+  preparedOp.payload['action'] = 'infill'
+  params['image'] = imageBase64(workingImage)
+  params['mask'] = imageBase64(workingMask)
+  params['inpaintImg2ImgStrength'] = request.strength
+  if (request.strength < 1)
+    params['img2img'] = { strength: request.strength, color_correct: request.color_correct }
+
+  preparedOp.inpaint_context = { source: workingImage, mask: originalMask }
+  preparedOp.operation = 'outpaint'
+  return preparedOp
+}
+
+function thresholdMask(width: number, height: number, signal: Uint8Array): Raster {
+  const out = new Uint8Array(width * height * 4)
+  for (let i = 0; i < width * height; i++) {
+    const v = signal[i]! > 127 ? 255 : 0
+    out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = v
+    out[i * 4 + 3] = 255
+  }
+  return new Raster(width, height, out)
+}
+
+/** Best-effort capture of the user's explicit input (Python exclude_unset equivalent). */
+function stripDefaults(raw: Record<string, unknown>): Record<string, unknown> {
+  return structuredClone(raw)
+}
+
+export type { ImageInput }
